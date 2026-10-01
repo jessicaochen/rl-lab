@@ -35,6 +35,9 @@ export CKPT_BUCKET=<gcs bucket>                             # HNS bucket, WI-bou
 # ladder, in order. The standard benchmark is a 2-step run (the default) with
 # SWE-bench Verified validation (100-instance subset) at start and end;
 # --var STEPS=10 for longer runs, --var VAL_TASKS=500 for the full Verified set.
+# --var VAL_TASKS=0 turns validation off (pure step-timing runs).
+# --var 'RAY_ENV_VARS=K=V K2=V2' injects env vars into every Ray actor via verl's
+#   runtime env (trainer ranks, vLLM servers, weight sync) — e.g. NCCL knobs; see the repo-level experiments/.
 rlbench run . --config config/h200-t8-s1 --keep --name h200-t8-s1
 rlbench run . --config config/h200-t8-s2 --keep --name h200-t8-s2
 rlbench run . --config config/h200-t16-s8 --keep --name h200-t16-s8

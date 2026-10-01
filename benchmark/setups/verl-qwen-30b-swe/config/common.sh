@@ -23,14 +23,17 @@ RUN_OUT=/data/outputs/${RUN_ID:-run}
 # validation: SWE-bench Verified (held-out; never trained on). Full 500 are
 # preprocessed once by uni-agent's swe_bench task; a deterministic subset
 # (sorted by instance_id, first VAL_TASKS) is what each run validates on —
-# 100 by default, `--var VAL_TASKS=500` for the full set.
-VAL_DIR=/data/datasets/swebench_verified
-if [ ! -f "$VAL_DIR/swe_bench_verified.parquet" ]; then
-  python3 -m uni_agent.tasks.swe_bench.preprocess --local-save-dir "$VAL_DIR"
-fi
-VAL_FILE="$VAL_DIR/swe_bench_verified-first$VAL_TASKS.parquet"
-if [ ! -f "$VAL_FILE" ]; then
-  python3 - "$VAL_DIR/swe_bench_verified.parquet" "$VAL_FILE" "$VAL_TASKS" <<'PY'
+# 100 by default, `--var VAL_TASKS=500` for the full set, `--var VAL_TASKS=0`
+# turns validation off (pure step-timing runs; verl still needs *a* val file,
+# so it is pointed at the training slice and never run).
+if [ "$VAL_TASKS" -gt 0 ]; then
+  VAL_DIR=/data/datasets/swebench_verified
+  if [ ! -f "$VAL_DIR/swe_bench_verified.parquet" ]; then
+    python3 -m uni_agent.tasks.swe_bench.preprocess --local-save-dir "$VAL_DIR"
+  fi
+  VAL_FILE="$VAL_DIR/swe_bench_verified-first$VAL_TASKS.parquet"
+  if [ ! -f "$VAL_FILE" ]; then
+    python3 - "$VAL_DIR/swe_bench_verified.parquet" "$VAL_FILE" "$VAL_TASKS" <<'PY'
 import sys
 from datasets import load_dataset
 src, dst, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -40,7 +43,21 @@ order = sorted(range(len(ids)), key=lambda i: ids[i])[:n]
 ds.select(order).to_parquet(dst)
 print(f"wrote {len(order)} validation instances -> {dst}")
 PY
+  fi
+  VAL_ARGS=(data.val_batch_size="$VAL_TASKS" trainer.val_before_train=True trainer.test_freq="$TOTAL_STEPS")
+else
+  VAL_FILE="$DATA_DIR/r2e_gym.parquet"
+  VAL_ARGS=(data.val_batch_size=null trainer.val_before_train=False trainer.test_freq=-1)
 fi
+
+# extra Ray runtime-env variables for every actor (trainer ranks, vLLM
+# servers, weight-sync engine): `--var 'RAY_ENV_VARS=K=V K2=V2'` (space
+# separated; values may contain commas). Used by the repo-level experiments/ to flip NCCL
+# transports per run without touching the RayCluster pods.
+EXTRA_OVERRIDES=()
+for kv in ${RAY_ENV_VARS:-}; do
+  EXTRA_OVERRIDES+=("+ray_kwargs.ray_init.runtime_env.env_vars.${kv%%=*}=\"${kv#*=}\"")
+done
 
 # pre-download the model once (head) so workers only ever read the shared
 # cache: concurrent cross-node downloads onto Filestore cause NFS stale file
@@ -97,7 +114,6 @@ exec python3 -m verl.trainer.main_ppo \
     data.max_prompt_length=$PROMPT_LENGTH \
     data.max_response_length=$RESPONSE_LENGTH \
     data.train_batch_size="$TRAIN_BATCH" \
-    data.val_batch_size="$VAL_TASKS" \
     actor_rollout_ref.rollout.n="$ROLLOUT_N" \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
@@ -178,13 +194,13 @@ exec python3 -m verl.trainer.main_ppo \
     trainer.project_name=rlbench-verl \
     trainer.experiment_name="${RUN_ID:-smoke}" \
     'trainer.logger=["console"]' \
-    trainer.val_before_train=True \
     trainer.save_freq=-1 \
     trainer.rollout_data_dir="$RUN_OUT/rollouts" \
     +trainer.validation_data_dir="$RUN_OUT/val-rollouts" \
-    trainer.test_freq="$TOTAL_STEPS" \
     trainer.total_epochs=1 \
     trainer.total_training_steps="$TOTAL_STEPS" \
     trainer.default_local_dir=/ckpt-gcs/${RUN_ID} \
     trainer.nnodes="$TRAIN_NNODES" \
-    trainer.n_gpus_per_node="$TRAIN_GPUS"
+    trainer.n_gpus_per_node="$TRAIN_GPUS" \
+    "${VAL_ARGS[@]}" \
+    "${EXTRA_OVERRIDES[@]}"
