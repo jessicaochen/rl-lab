@@ -1,0 +1,3 @@
+# Python build artifacts (compiled caches embed absolute source paths)
+__pycache__/
+*.pyc

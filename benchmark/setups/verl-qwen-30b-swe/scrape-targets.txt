@@ -1,0 +1,7 @@
+# Extra metrics targets for rlbench (pods by label, re-resolved every interval).
+# GKE's managed DCGM exporter already exposes the profiling fields we want
+# (SM_ACTIVE, PIPE_TENSOR_ACTIVE, DRAM_ACTIVE, GR_ENGINE_ACTIVE, NVLink/PCIe
+# bytes) with Hostname = node name. Running our own exporter alongside it
+# yields blank profiling fields (one DCGM profiling client per GPU), so we
+# scrape the managed one instead.
+pods gke-managed-system app.kubernetes.io/name=gke-managed-dcgm-exporter 9400 /metrics

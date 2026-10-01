@@ -1,0 +1,56 @@
+# Submitter Job — rlbench's completion signal. Waits for the RayCluster
+# dashboard, preprocesses the dataset onto the shared volume, then submits the
+# verl driver via `ray job submit` (blocking, --working-dir uploads the
+# rendered run config so run.sh + task_config.yaml land in the driver's cwd).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verl-train
+  namespace: rlbench-verl-swe
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: verl-train
+    spec:
+      restartPolicy: Never
+      serviceAccountName: verl-driver
+      nodeSelector:
+        cloud.google.com/gke-nodepool: ${CPU_POOL}
+      containers:
+      - name: submit
+        image: ${DRIVER_IMAGE}
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -euo pipefail
+          RAY_ADDR="http://verl-head-svc.rlbench-verl-swe.svc.cluster.local:8265"
+          echo "waiting for Ray dashboard at $$RAY_ADDR"
+          python3 - <<'PYEOF'
+          import time, urllib.request
+          for _ in range(120):
+              try:
+                  urllib.request.urlopen("http://verl-head-svc.rlbench-verl-swe.svc.cluster.local:8265/api/version", timeout=5)
+                  print("ray dashboard up"); break
+              except Exception:
+                  time.sleep(10)
+          else:
+              raise SystemExit("ray dashboard never came up")
+          PYEOF
+          exec ray job submit --address "$$RAY_ADDR" \
+            --working-dir /etc/rlbench/config \
+            -- bash run.sh
+        env:
+        - name: RUN_ID
+          value: ${RUN_ID}
+        volumeMounts:
+        - {name: run-config, mountPath: /etc/rlbench/config}
+        - {name: shared-data, mountPath: /data}
+        resources:
+          requests: {cpu: "1", memory: 4Gi}
+      volumes:
+      - name: run-config
+        configMap: {name: rlbench-run-config}
+      - name: shared-data
+        persistentVolumeClaim: {claimName: shared-data}

@@ -1,0 +1,13 @@
+# Shared RWX volume (Filestore): datasets (preprocessed parquet), HF cache
+# (model shards read by trainer + rollout), smoke-run checkpoints.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-data
+  namespace: rlbench-verl-swe
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: zonal-rwx
+  resources:
+    requests:
+      storage: 1Ti

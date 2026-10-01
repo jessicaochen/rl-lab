@@ -1,0 +1,5 @@
+# Recorded runs contain PII (logs, metrics) and cluster identifiers.
+# They are backed up externally and must never be committed.
+*
+!.gitignore
+!README.md

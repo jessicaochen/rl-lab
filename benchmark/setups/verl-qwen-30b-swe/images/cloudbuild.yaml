@@ -1,0 +1,16 @@
+# Cloud Build config for the verl driver image. Portable: image path via
+# substitution. BuildKit (buildx) — same rationale as the prime-rl setup:
+# large upstream layers, registry-cache friendly.
+#
+#   gcloud builds submit --config images/cloudbuild.yaml \
+#     --substitutions=_IMAGE=<registry>/verl-driver:<tag> .
+steps:
+- name: gcr.io/cloud-builders/docker
+  args: ["buildx", "create", "--use", "--name", "bk"]
+- name: gcr.io/cloud-builders/docker
+  args: ["buildx", "build", "-f", "images/driver.Dockerfile",
+         "-t", "${_IMAGE}", "--push", "."]
+options:
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 300
+timeout: 5400s

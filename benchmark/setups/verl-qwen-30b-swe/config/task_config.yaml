@@ -1,0 +1,55 @@
+# Task config for the r2e_gym blackbox recipe on agent-sandbox.
+# Layered by TaskConfigResolver: these defaults + the sample row (image,
+# metadata, prompt) + the runtime model binding from the gateway session.
+# No proxy_port: direct-reach mode — the sandbox calls the gateway's real
+# URL (Ray node pod IP), reachable in-cluster.
+- name: r2e_gym
+  eval_timeout: 600
+  sandbox:
+    provider: agent_sandbox
+    runtime_timeout: 3600
+    image_map:
+      - from: "**"
+        to: "${IMAGE_CACHE_PREFIX}/**"
+    sandbox_kwargs:
+      namespace: rlbench-verl-swe
+      cpu: 2.0
+      memory_gb: 6.0
+      ready_timeout: 1800
+      mounts:
+        - target: /opt/mini-swe-agent
+          image_url: ${TOOL_IMAGE}
+  agent:
+    name: mini_swe_agent
+    step_limit: 100
+    run_timeout: 1800
+    tool_python: /opt/mini-swe-agent/bin/python
+    run_agent_script: /opt/mini-swe-agent/bin/run_agent.py
+
+# SWE-bench Verified — VALIDATION rows (uni-agent's built-in swe_bench task:
+# per-instance swebench images, F2P/P2P grading inside the sandbox). Same
+# sandbox provider + tool mount as r2e_gym; the agent runs from the image's
+# conda env `testbed`. Selected per row by `tools_kwargs.task.name`.
+- name: swe_bench
+  eval_timeout: 900
+  sandbox:
+    provider: agent_sandbox
+    runtime_timeout: 3600
+    image_map:
+      - from: "**"
+        to: "${IMAGE_CACHE_PREFIX}/**"
+    sandbox_kwargs:
+      namespace: rlbench-verl-swe
+      cpu: 2.0
+      memory_gb: 6.0
+      ready_timeout: 1800
+      mounts:
+        - target: /opt/mini-swe-agent
+          image_url: ${TOOL_IMAGE}
+  agent:
+    name: mini_swe_agent
+    step_limit: 100
+    run_timeout: 1800
+    conda_env: testbed
+    tool_python: /opt/mini-swe-agent/bin/python
+    run_agent_script: /opt/mini-swe-agent/bin/run_agent.py

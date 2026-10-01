@@ -1,0 +1,42 @@
+# The verl driver (uni-agent agent_sandbox provider) creates one Sandbox CR
+# per episode in this namespace and execs into the resulting pods.
+# Same rules as the retired prime-rl setup, incl. the websocket-exec lesson:
+# the python client's exec is a GET, so pods/exec needs `get`, not just `create`.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: verl-driver
+  namespace: rlbench-verl-swe
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbox-runner
+  namespace: rlbench-verl-swe
+rules:
+- apiGroups: ["agents.x-k8s.io"]
+  resources: ["sandboxes"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create", "get", "list"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sandbox-runner
+  namespace: rlbench-verl-swe
+subjects:
+- kind: ServiceAccount
+  name: verl-driver
+  namespace: rlbench-verl-swe
+roleRef:
+  kind: Role
+  name: sandbox-runner
+  apiGroup: rbac.authorization.k8s.io
