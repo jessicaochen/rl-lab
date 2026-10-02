@@ -1,0 +1,437 @@
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index f510875d..506ab54b 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -237,11 +237,17 @@ class PPOTrainer(ABC):
+         # 1. define actor and rollout class
+         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+         actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
++        # [gpu-mem experiment] RLBENCH_NO_HYBRID_ROLLOUT=1: clean disaggregated layout, no
++        # hybrid vLLM replicas on the trainer GPUs. Workers get role "actor" so they build no
++        # ServerAdapter (engine_workers: `if "rollout" in self.role`).
++        no_hybrid_rollout = os.environ.get("RLBENCH_NO_HYBRID_ROLLOUT") == "1"
++        if no_hybrid_rollout:
++            assert actor_role == Role.ActorRollout, "RLBENCH_NO_HYBRID_ROLLOUT needs a config without reference policy"
+         actor_rollout_cls = RayClassWithInitArgs(
+             cls=self.role_worker_mapping[actor_role],
+             config=self.config.actor_rollout_ref,
+             distillation_config=self.config.get("distillation"),
+-            role=str(actor_role),
++            role="actor" if no_hybrid_rollout else str(actor_role),
+         )
+         self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
+ 
+@@ -347,23 +353,29 @@ class PPOTrainer(ABC):
+             self.teacher_model_manager = None
+             self.distillation_config = None
+ 
+-        # 9. initialize agent loop manager
+-        self.llm_server_manager: LLMServerManager = LLMServerManager.create(
+-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
+-        )
++        if os.environ.get("RLBENCH_NO_HYBRID_ROLLOUT") == "1":
++            # [gpu-mem experiment] no hybrid replicas: nothing to manage on the trainer GPUs
++            logger.info("RLBENCH_NO_HYBRID_ROLLOUT=1: skipping hybrid rollout replicas on trainer GPUs")
++            self.llm_server_manager = None
++            self.checkpoint_manager = None
++        else:
++            # 9. initialize agent loop manager
++            self.llm_server_manager: LLMServerManager = LLMServerManager.create(
++                config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
++            )
+ 
+-        # 10. initialize checkpoint engine manager
+-        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+-        checkpoint_engine_config.backend = "naive"
+-        self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
+-            config=checkpoint_engine_config,
+-            actor_wg=self.actor_rollout_wg,
+-            replicas=self.llm_server_manager.get_replicas(),
+-        )
+-        logger.info("checkpoint engine manager initialized")
++            # 10. initialize checkpoint engine manager
++            checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
++            checkpoint_engine_config.backend = "naive"
++            self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
++                config=checkpoint_engine_config,
++                actor_wg=self.actor_rollout_wg,
++                replicas=self.llm_server_manager.get_replicas(),
++            )
++            logger.info("checkpoint engine manager initialized")
+ 
+-        # sleep all replicas to load checkpoint
+-        self.checkpoint_manager.sleep_replicas()
++            # sleep all replicas to load checkpoint
++            self.checkpoint_manager.sleep_replicas()
+         self._load_checkpoint()
+ 
+         logger.info("all initialize finished, ready to fit")
+diff --git a/verl/trainer/ppo/v1/trainer_separate_async.py b/verl/trainer/ppo/v1/trainer_separate_async.py
+index 18a06ee2..1ec171f9 100644
+--- a/verl/trainer/ppo/v1/trainer_separate_async.py
++++ b/verl/trainer/ppo/v1/trainer_separate_async.py
+@@ -83,7 +83,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+ 
+         # initialize standalone rollout
+         # TODO: make initialization parallel with super().init()
+-        hybrid_num_replicas = len(self.llm_server_manager.rollout_replicas)
++        hybrid_num_replicas = len(self.llm_server_manager.rollout_replicas) if self.llm_server_manager else 0
+         self.standalone_server_manager: LLMServerManager = LLMServerManager.create(
+             config=self.config, start_rank=hybrid_num_replicas
+         )
+@@ -97,8 +97,11 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+         )
+ 
+         # hybrid engine is in rollout mode after initialization
+-        self.current_mode = HybridEngineMode.ROLLOUT
+-        self.add_replicas_to_balancer()
++        if self.llm_server_manager is None:
++            self.current_mode = HybridEngineMode.TRAINER  # [gpu-mem experiment] no hybrid engine
++        else:
++            self.current_mode = HybridEngineMode.ROLLOUT
++            self.add_replicas_to_balancer()
+ 
+     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+         """Version-aware old_log_probs computation for Decoupled PPO.
+@@ -133,7 +136,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+     def on_init_end(self):
+         # update weights after loading checkpoint
+         self.standalone_checkpoint_manager.update_weights(self.global_steps)
+-        self.checkpoint_manager.update_weights(self.global_steps)
++        if self.checkpoint_manager is not None:
++            self.checkpoint_manager.update_weights(self.global_steps)
+ 
+     def on_train_begin(self):
+         if self.config.skip.rollout_tq.enable:
+@@ -144,12 +148,12 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+         logger.info(f"Added {num_warmup_batches} warmup batches to the agent loop manager")
+ 
+     def on_validate_begin(self):
+-        if self.current_mode == HybridEngineMode.TRAINER:
++        if self.checkpoint_manager is not None and self.current_mode == HybridEngineMode.TRAINER:
+             logger.info("Switching hybrid engine to rollout mode for validation")
+             self.switch_to_rollout()
+ 
+     def on_sample_begin(self):
+-        if self.current_mode == HybridEngineMode.TRAINER and self.should_switch_to_rollout():
++        if self.checkpoint_manager is not None and self.current_mode == HybridEngineMode.TRAINER and self.should_switch_to_rollout():
+             logger.info("Switching hybrid engine to rollout mode for generation")
+             self.switch_to_rollout()
+ 
+@@ -179,6 +183,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+ 
+     def switch_to_rollout(self):
+         # TODO: disable auto offload in config and offload according to the switch strategy
++        if self.checkpoint_manager is None:
++            return
+         self.checkpoint_manager.update_weights(self.global_steps)
+         self.checkpoint_manager.resume_generation_replicas()
+         self.add_replicas_to_balancer()
+@@ -186,12 +192,16 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+ 
+     def switch_to_trainer(self):
+         # TODO: disable auto offload in config and offload according to the switch strategy
++        if self.checkpoint_manager is None:
++            return
+         self.remove_replicas_from_balancer()
+         self.checkpoint_manager.abort_replicas()
+         self.checkpoint_manager.sleep_replicas()
+         self.current_mode = HybridEngineMode.TRAINER
+ 
+     def add_replicas_to_balancer(self):
++        if self.llm_server_manager is None:
++            return
+         global_load_balancer = self.standalone_server_manager.global_load_balancer
+         servers = dict(
+             zip(self.llm_server_manager.server_addresses, self.llm_server_manager.server_handles, strict=True)
+@@ -199,6 +209,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+         ray.get(global_load_balancer.add_servers.remote(servers))
+ 
+     def remove_replicas_from_balancer(self):
++        if self.llm_server_manager is None:
++            return
+         global_load_balancer = self.standalone_server_manager.global_load_balancer
+         ray.get(global_load_balancer.remove_servers.remote(self.llm_server_manager.server_addresses))
+ 
+diff --git a/verl/utils/gpu_mem_log.py b/verl/utils/gpu_mem_log.py
+new file mode 100644
+index 00000000..53c0b6b3
+--- /dev/null
++++ b/verl/utils/gpu_mem_log.py
+@@ -0,0 +1,53 @@
++# Temporary instrumentation for rl-lab experiments/gpu-host-offload.
++# One-line GPU + host memory snapshots printed around every GPU<->host move,
++# on every rank. Lines start with "[gpu-mem]" and are parsed by report.py.
++import os
++import socket
++
++import psutil
++import torch
++
++GB = 1024**3
++
++
++def snapshot() -> dict:
++    """GPU (allocator + device-level) and host (process + system) memory, in GB."""
++    torch.cuda.synchronize()
++    free, total = torch.cuda.mem_get_info()
++    proc = psutil.Process()
++    return {
++        "gpu_allocated_gb": torch.cuda.memory_allocated() / GB,
++        "gpu_reserved_gb": torch.cuda.memory_reserved() / GB,
++        "gpu_device_used_gb": (total - free) / GB,
++        "gpu_device_total_gb": total / GB,
++        "host_rss_gb": proc.memory_info().rss / GB,
++        "host_used_gb": psutil.virtual_memory().used / GB,
++    }
++
++
++def _rank() -> int:
++    try:
++        import torch.distributed as dist
++
++        if dist.is_available() and dist.is_initialized():
++            return dist.get_rank()
++    except Exception:
++        pass
++    return int(os.environ.get("RANK", -1))
++
++
++def emit(role: str, point: str, event: str, snap: dict, seconds: float | None = None, rank=None, **extra) -> None:
++    fields = [
++        "[gpu-mem]",
++        f"role={role}",
++        f"rank={_rank() if rank is None else rank}",
++        f"host={socket.gethostname()}",
++        f"pid={os.getpid()}",
++        f"point={point}",
++        f"event={event}",
++    ]
++    fields += [f"{k}={v:.3f}" for k, v in snap.items()]
++    if seconds is not None:
++        fields.append(f"seconds={seconds:.3f}")
++    fields += [f"{k}={v}" for k, v in extra.items()]
++    print(" ".join(fields), flush=True)
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index 0358497c..2279dd9d 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -797,6 +797,58 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
+     get_torch_device().empty_cache()
+ 
+ 
++def megatron_footprint(models, optimizer=None) -> dict:
++    """[gpu-mem experiment] Bytes of the offloadable Megatron state by location.
++
++    Walks exactly the objects the offload helpers touch: DDP param/grad buffers
++    (dense + expert), the pinned cpu_data copies, the distributed optimizer's
++    fp32 main-param shards and the (hybrid-device) optimizer state tensors.
++    Returns gpu_resident_* / cpu_resident_* byte counts per category.
++    """
++    cats = ("params", "grads", "main_params", "opt_state")
++    gpu = dict.fromkeys(cats, 0)
++    cpu = dict.fromkeys(cats, 0)
++
++    def add(t, cat):
++        if not isinstance(t, torch.Tensor):
++            return
++        n = t.untyped_storage().nbytes()
++        (cpu if t.device.type == "cpu" else gpu)[cat] += n
++
++    for model_chunk in models:
++        if isinstance(model_chunk, DDP):
++            for buffers in (model_chunk.buffers, model_chunk.expert_parallel_buffers):
++                for buffer in buffers:
++                    add(buffer.param_data, "params")
++                    add(getattr(buffer.param_data, "cpu_data", None), "params")
++                    add(buffer.grad_data, "grads")
++            for param in model_chunk.module.parameters():
++                if not param.requires_grad:
++                    add(param.data, "params")
++        else:
++            for param in model_chunk.parameters():
++                add(param.data, "params")
++                add(param.grad, "grads")
++
++    if optimizer is not None:
++        opts = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else [optimizer]
++        for opt in opts:
++            for group in getattr(opt, "shard_fp32_from_float16_groups", None) or []:
++                for t in group if isinstance(group, list) else [group]:
++                    add(t, "main_params")
++            inner = getattr(opt, "optimizer", None)
++            if inner is not None:
++                subs = getattr(inner, "sub_optimizers", None) or [inner]
++                for sub in subs:
++                    for state in getattr(sub, "state", {}).values():
++                        for v in state.values():
++                            add(v, "opt_state")
++
++    out = {f"gpu_resident_{k}": v for k, v in gpu.items()}
++    out.update({f"cpu_resident_{k}": v for k, v in cpu.items()})
++    return out
++
++
+ @torch.no_grad()
+ def offload_megatron_copy_params(optimizers):
+     """
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index e8a6c560..dc405dee 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -64,6 +64,7 @@ from verl.utils.megatron.tensor_parallel import (
+ )
+ from verl.utils.megatron_peft_utils import build_peft_config_for_vllm
+ from verl.utils.megatron_utils import (
++    megatron_footprint,
+     check_mtp_config,
+     get_megatron_module_device,
+     get_megatron_mtp_loss,
+@@ -710,7 +711,7 @@ class MegatronEngine(BaseEngine):
+         self.lr_scheduler.step(1)
+         return get_megatron_last_lr(self.optimizer)
+ 
+-    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
++    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True, point: str = None):
+         """
+         Move model parameters, optimizer states, or both to the specified device.
+         Note that this function executes irrespective of offload config. It serves as manual control
+@@ -725,6 +726,22 @@ class MegatronEngine(BaseEngine):
+         device_name = get_device_name()
+ 
+         assert device in (device_name, "cpu")
++
++        # [gpu-mem experiment] measure GPU + host memory and the offloadable footprint
++        # before/after every move, on every rank. `point` names the call site; by default
++        # it is derived from the engine mode (None at init, train/eval inside the contexts).
++        import time as _time
++
++        from verl.utils.gpu_mem_log import emit, snapshot
++
++        if point is None:
++            point = {None: "init", "train": "train_end", "eval": "eval_end"}.get(getattr(self, "mode", None), str(self.mode))
++        direction = "to_cpu" if device == "cpu" else "to_gpu"
++        tag = f"{point}:{direction}"
++        fp_before = megatron_footprint(self.module, self.optimizer)
++        emit("trainer", tag, "before", snapshot(), model=int(model), optimizer=int(optimizer), grad=int(grad), **fp_before)
++        _t0 = _time.perf_counter()
++
+         if device == device_name:
+             if model:
+                 load_megatron_model_to_gpu(self.module, load_grad=grad)
+@@ -738,6 +755,33 @@ class MegatronEngine(BaseEngine):
+         else:
+             raise ValueError(f"Invalid device type: {device}")
+ 
++        get_torch_device().synchronize()
++        _seconds = _time.perf_counter() - _t0
++        fp_after = megatron_footprint(self.module, self.optimizer)
++        gpu_drop = {k: fp_before[k] - fp_after[k] for k in fp_before if k.startswith("gpu_resident_")}
++        if device == "cpu":
++            copied = sum(v for k, v in gpu_drop.items() if k != "gpu_resident_grads")
++            discarded = gpu_drop["gpu_resident_grads"]
++            copied_back = 0
++        else:
++            copied = 0
++            discarded = 0
++            copied_back = -sum(gpu_drop.values())
++        emit(
++            "trainer",
++            tag,
++            "after",
++            snapshot(),
++            seconds=_seconds,
++            model=int(model),
++            optimizer=int(optimizer),
++            grad=int(grad),
++            bytes_copied_to_host=copied,
++            bytes_discarded=discarded,
++            bytes_copied_to_gpu=copied_back,
++            **fp_after,
++        )
++
+     def get_data_parallel_rank(self):
+         if self.engine_config.dynamic_context_parallel:
+             # in order to let every dp-cp group has full data to split, we set dp=1
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index c0ef0114..d8e2d2a1 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -755,6 +755,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 return metrics or {}
+             per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+             metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
++            # [gpu-mem experiment] get_per_tensor_param reloaded the params for export; offload
++            # them again right away (mirrors step 3 of the naive path below), so the trainer
++            # GPUs hold nothing offloadable while waiting for the next batch.
++            if self.actor.engine.is_param_offload_enabled:
++                self.actor.engine.to("cpu", model=True, optimizer=False, grad=False, point="post_sync")
++                aggressive_empty_cache(force_sync=True)
+             return metrics or {}
+ 
+         set_expandable_segments(False)
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index a015e8fd..0bb028c6 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -204,6 +204,24 @@ class vLLMColocateWorkerExtension:
+         spec = self.model_runner.vllm_config.speculative_config
+         return spec is not None and spec.method == "mtp" and self._get_drafter_model() is not None
+ 
++    def report_memory(self) -> dict:
++        """[gpu-mem experiment] GPU/host snapshot of this TP worker process plus the logical
++        sizes of the loaded weights and KV cache (sizes stay constant while asleep; the
++        device-level numbers show what is physically resident)."""
++        from verl.utils.gpu_mem_log import snapshot
++
++        snap = snapshot()
++        try:
++            weights = sum(p.numel() * p.element_size() for m in self._iter_all_models() for p in m.parameters())
++        except Exception:
++            weights = -1
++        try:
++            kv_caches = getattr(self.model_runner, "kv_caches", None) or []
++            kv = sum(t.numel() * t.element_size() for t in kv_caches if isinstance(t, torch.Tensor))
++        except Exception:
++            kv = -1
++        return {"rank": getattr(self, "rank", -1), "snapshot": snap, "weights_bytes": weights, "kv_cache_bytes": kv}
++
+     def _iter_all_models(self):
+         """Yield models that need weight updates.
+ 
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 55821b70..73be1edb 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -816,6 +816,31 @@ class vLLMHttpServer:
+         """
+         if self.node_rank != 0 or not self.config.free_cache_engine:
+             return
++        if self.rollout_mode != RolloutMode.STANDALONE:
++            return
++        # [gpu-mem experiment] "end of sampling" = this weight-sync pause (requests aborted
++        # and drained). Measure -> offload everything vLLM can (sleep level 1: weights to
++        # pinned host, KV cache discarded) -> measure -> reload -> measure, then hand back to
++        # the normal flow (in-place weight update, prefix-cache drop, resume).
++        import time as _time
++
++        from verl.utils.gpu_mem_log import emit
++
++        def _emit(event, reports, seconds=None):
++            for r in reports:
++                extra = {k: v for k, v in r.items() if k not in ("snapshot", "rank")}
++                emit("sampler", f"replica{self.replica_rank}:sync_pause", event, r["snapshot"], seconds=seconds, rank=r["rank"], **extra)
++
++        _emit("before", await self.engine.collective_rpc("report_memory"))
++        _t0 = _time.perf_counter()
++        await self.engine.sleep(level=1)
++        _sleep_s = _time.perf_counter() - _t0
++        _emit("after_sleep", await self.engine.collective_rpc("report_memory"), _sleep_s)
++        _t0 = _time.perf_counter()
++        await self.engine.wake_up(tags=["weights", "kv_cache"])
++        _wake_s = _time.perf_counter() - _t0
++        await self.engine.reset_prefix_cache(reset_connector=True)
++        _emit("after_wake", await self.engine.collective_rpc("report_memory"), _wake_s)
+ 
+     async def resume_kv_cache(self):
+         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""

@@ -59,6 +59,17 @@ for kv in ${RAY_ENV_VARS:-}; do
   EXTRA_OVERRIDES+=("+ray_kwargs.ray_init.runtime_env.env_vars.${kv%%=*}=\"${kv#*=}\"")
 done
 
+# knobs for the repo-level experiments/. `--var RAY_DEDUP_LOGS=0`: Ray collapses worker log
+# lines that differ only in numbers; 0 keeps every rank's lines (read by the driver process,
+# i.e. this entrypoint's python, so a plain export is enough). `--var NO_HYBRID_ROLLOUT=1`:
+# clean disaggregated layout (no hybrid vLLM replicas on the trainer GPUs) — honoured only by
+# the patched verl from experiments/gpu-host-offload; verl's trainer runs inside a Ray actor
+# (TaskRunnerV1), which sees runtime-env variables, not this shell's exports.
+export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
+if [ "${NO_HYBRID_ROLLOUT:-0}" = "1" ]; then
+  EXTRA_OVERRIDES+=('+ray_kwargs.ray_init.runtime_env.env_vars.RLBENCH_NO_HYBRID_ROLLOUT="1"')
+fi
+
 # pre-download the model once (head) so workers only ever read the shared
 # cache: concurrent cross-node downloads onto Filestore cause NFS stale file
 # handles mid-load

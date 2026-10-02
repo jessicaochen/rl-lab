@@ -38,6 +38,8 @@ export CKPT_BUCKET=<gcs bucket>                             # HNS bucket, WI-bou
 # --var VAL_TASKS=0 turns validation off (pure step-timing runs).
 # --var 'RAY_ENV_VARS=K=V K2=V2' injects env vars into every Ray actor via verl's
 #   runtime env (trainer ranks, vLLM servers, weight sync) — e.g. NCCL knobs; see the repo-level experiments/.
+# --var RAY_DEDUP_LOGS=0 keeps per-rank worker log lines; --var NO_HYBRID_ROLLOUT=1 (patched verl only)
+#   drops the hybrid vLLM replicas from the trainer GPUs; see experiments/gpu-host-offload/.
 rlbench run . --config config/h200-t8-s1 --keep --name h200-t8-s1
 rlbench run . --config config/h200-t8-s2 --keep --name h200-t8-s2
 rlbench run . --config config/h200-t16-s8 --keep --name h200-t16-s8
