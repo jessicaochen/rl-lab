@@ -61,6 +61,13 @@ class RunFolder:
             json.dumps({"path": str(setup_root), "git_sha": sha, "dirty": dirty}, indent=2)
         )
 
+    def record_features(self, features: list) -> None:
+        """Which opt-in features ran, with their resolved vars.env (provenance
+        for A/B comparisons; the rendered config carries the effect)."""
+        (self.config / "features.json").write_text(json.dumps(
+            [{"name": f.name, "path": str(f.root), "vars": f.vars} for f in features], indent=2
+        ))
+
     def record_cluster_identity(self) -> None:
         identity = {
             "context": kube.current_context(),

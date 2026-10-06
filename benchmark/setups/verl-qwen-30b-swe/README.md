@@ -18,8 +18,11 @@ no tunnel). Successor to the retired prime-rl setup; same cluster infra.
 | `tasks/` | uni-agent task `r2e_gym`: hide tests → agent (or gold-patch oracle) → restore → `run_tests.sh` → exact pytest-map reward. |
 | `images/` | `driver.Dockerfile` (verl@v0.9.0 + uni-agent + our packages), `tool.Dockerfile` (mini-swe-agent sidecar, busybox final stage). |
 | `config/common.sh` | The hydra invocation; every topology/batch knob is a shell var. Enforces `TRAIN_BATCH == SYNC_STEP × MINI_BATCH` and `TP·CP·EP ≤ 8` (EP on one node). |
-| `config/h200-t<T>-s<S>/` | One dir per ladder rung (`h200-t8-s1`, `h200-t8-s2`, `h200-t16-s8`): `run.sh` sets the knobs (default `TOTAL_STEPS=2`) and execs `common.sh` (symlinked, with `task_config.yaml`). |
+| `config/h200-t<T>-s<S>/` | One dir per ladder rung (`h200-t8-s1`, `h200-t8-s2`, `h200-t16-s8`, `h200-t16-s4x2`): `run.sh` sets the knobs (default `TOTAL_STEPS=2`) and execs `common.sh` (symlinked, with `task_config.yaml`). `s<R>x<G>` = R vLLM replicas of G GPUs (`ROLLOUT_GPUS=R·G`, `ROLLOUT_TP=G`); plain `s<S>` is one replica of S GPUs. |
+| `features/<name>/` | rlbench opt-in features (`rlbench run ... --feature <name>`), each with its own README. `inference-scheduler`: py-inference-scheduler routes policy requests across the sampler's replicas (needs a `s<R>x<G>` rung and driver image ≥ v7). |
+| `provider/rlbench_verl_provider/rollout_adapter.py` | Always-on `agent_loop_manager_class` (wraps uni-agent's adapter): per-request gateway records + per-replica vLLM `/metrics` snapshots on the shared volume (both arms of any comparison get identical instrumentation); `RLBENCH_ROUTER` selects verl's balancer (default) or the scheduler. |
 | `hooks/` | `pre-setup.sh` deletes leftover rollout sandboxes (previous run's sessions can outlive the Ray job); `post-run.sh` snapshots GKE operations + node inventory into the run folder. |
+| `tools/compare_runs.py` | Baseline-vs-feature table across run folders (`baseline=runs/<a> inference-scheduler=runs/<b>`): sampling / generation (per-turn latency percentiles, TTFT, queue time, prefix-cache hit rate, replica balance) / training / sync / end-to-end rows + ratios, plus each run's feature evidence. `tools/gen_latency.py` is the generation part for a single run. |
 | `tools/run_report.py` | The metric sheet for one run folder: RL convergence (SWE-bench Verified accuracy start/end, rewards), RL efficiency (GPU duty cycle per role, trainer busy fraction), RL performance (seq lengths, wall clock, step time, tokens/s/GPU, TFLOP/s/GPU), trajectories. `tools/duty_cycle.py`, `tools/trajectories.py` (decode token-level trajectories to text), `tools/ladder_row.py` are its parts. |
 | `docs/scaling-ladder.md` | Per-rung results table (filled as each rung passes). |
 | `docs/scaling-parity.md` | How Megatron matches prime-rl's FSDP/EP8/CPU-offload recipe; weight-sync backends; the 131k path. |
@@ -43,6 +46,10 @@ export CKPT_BUCKET=<gcs bucket>                             # HNS bucket, WI-bou
 rlbench run . --config config/h200-t8-s1 --keep --name h200-t8-s1
 rlbench run . --config config/h200-t8-s2 --keep --name h200-t8-s2
 rlbench run . --config config/h200-t16-s8 --keep --name h200-t16-s8
+# multi-replica sampler (4 x TP2) — the rung request-routing features are measured on:
+rlbench run . --config config/h200-t16-s4x2 --keep --var VAL_TASKS=0 --name h200-t16-s4x2
+rlbench run . --config config/h200-t16-s4x2 --keep --var VAL_TASKS=0 --name h200-t16-s4x2-sched --feature inference-scheduler
+python3 tools/compare_runs.py baseline=runs/<a> inference-scheduler=runs/<b>
 ```
 
 Templating: `${NAME}` / `${NAME:-default}` are rlbench render-time variables

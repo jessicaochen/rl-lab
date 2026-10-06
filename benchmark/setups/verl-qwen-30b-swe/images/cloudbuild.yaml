@@ -3,13 +3,16 @@
 # large upstream layers, registry-cache friendly.
 #
 #   gcloud builds submit --config images/cloudbuild.yaml \
-#     --substitutions=_IMAGE=<registry>/verl-driver:<tag> .
+#     --substitutions=_IMAGE=<registry>/verl-driver:<tag>[,_PYIS_REF=<sha>] .
 steps:
 - name: gcr.io/cloud-builders/docker
   args: ["buildx", "create", "--use", "--name", "bk"]
 - name: gcr.io/cloud-builders/docker
   args: ["buildx", "build", "-f", "images/driver.Dockerfile",
+         "--build-arg", "PYIS_REF=${_PYIS_REF}",
          "-t", "${_IMAGE}", "--push", "."]
+substitutions:
+  _PYIS_REF: 291b31be078c88e28aa0dd00dc67f03d82d81312   # py-inference-scheduler pin (keep in sync with the Dockerfile default)
 options:
   machineType: E2_HIGHCPU_8
   diskSizeGb: 300

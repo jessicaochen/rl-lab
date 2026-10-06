@@ -1,0 +1,20 @@
+# py-inference-scheduler profile "prefix": the treatment of the project's own SWE-bench
+# A/B (docs/guides/swe_bench_guide.md, 2026-08-27: -10 % mean generation per trajectory
+# on Qwen2.5-7B, 4 x TP2). One scorer, so every turn goes to the replica that already
+# holds the longest cached prefix of its prompt ("soft stickiness"); a prompt with no
+# cached prefix anywhere (first turn of a new task) falls back to the least-loaded
+# replica (min_match_ratio 0.0). Default profile of the rlbench feature.
+#
+# Plugin defaults kept on purpose: block_size 64 and max_prefix_blocks 256 are BYTES of
+# the JSON-serialized token ids (~10 tokens per block), so the scorer keys on roughly the
+# first 2.5k tokens of a prompt — enough to identify a session and to co-locate the 8
+# GRPO rollouts of one task, which share their initial prompt verbatim.
+profile_handler:
+  type: single_profile
+profiles:
+  prefix:
+    scorers:
+      - type: prefix_cache
+        weight: 1.0
+    picker:
+      type: max_score

@@ -1,0 +1,25 @@
+# py-inference-scheduler profile "backpressure": the repo's verl example (load scorers
+# first, prefix last). Measured 2026-10-05 on h200-t16-s4x2: with engines never queuing,
+# least_queue outvoted prefix_cache and 38-53 % of trajectories were served by more than
+# one replica (baseline 0 %), prefix-cache hit rate 0.885 vs 0.936. Select with
+# `--var SCHEDULER_CONFIG=scheduler-backpressure.yaml`. (Original header: the project's
+# own verl example). Pipeline per request: flow control -> filters -> scorers
+# (weighted, normalized to [0,1]) -> picker. Tune weights per workload; the
+# scheduler hot-reloads this file on mtime change (it is copied to
+# $RUN_OUT/scheduler.yaml at job start, so edits must go there to take effect
+# mid-run — and then they are NOT what the run folder recorded).
+profile_handler:
+  type: single_profile
+profiles:
+  backpressure:
+    scorers:
+      - type: waiting_queue   # pending requests on the engine (vLLM num_requests_waiting)
+        weight: 5.0
+      - type: least_queue     # this gateway's in-flight count per replica
+        weight: 2.0
+      - type: kv_cache        # free KV cache share (vLLM kv_cache_usage_perc)
+        weight: 1.0
+      - type: prefix_cache    # longest cached prefix of the prompt token ids
+        weight: 1.0
+    picker:
+      type: max_score

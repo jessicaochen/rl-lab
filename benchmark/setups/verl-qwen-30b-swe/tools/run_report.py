@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from ladder_row import parse as parse_steps  # noqa: E402
 from duty_cycle import report as duty_report  # noqa: E402
+from gen_latency import report as gen_report  # noqa: E402
 
 H200_PEAK_TFLOPS = 989.0
 
@@ -88,11 +89,32 @@ def build(rf: Path, trainer_gpus=None, sampler_gpus=None):
         "sampler_gen_tokens_per_s_per_gpu": (resp * batch_eps / mean("timing_s/gen") / sg) if resp and batch_eps and mean("timing_s/gen") else None,
         "mfu_actor": mfu, "tflops_per_gpu": (mfu * H200_PEAK_TFLOPS) if mfu else None,
       },
+      "generation": _generation(gen_report(rf)),
       "trajectories": {**(counts_from_agent_logs(rf) or {}),
         "token_level": "logs/agent-logs.tar.gz (trajectory.npz per session)",
         "text_dumps": [p.name for p in (rf / "logs").glob("*rollouts.tar.gz")] or "none (run predates rollout_data_dir)"},
     }
     return out
+
+def _generation(g):
+    """Headline generation-side numbers (full detail: tools/gen_latency.py)."""
+    gw = g["gateway"].get("steady") or g["gateway"].get("all") or {}
+    tj = g["gateway"].get("trajectories_steady") or g["gateway"].get("trajectories_all") or {}
+    rm = g["replica_metrics"].get("aggregate") or {}
+    ls = g["vllm_log_stats"]
+    return {
+        "gateway_requests": gw.get("requests"), "per_turn_latency_p50_s": gw.get("latency_p50_s"),
+        "generation_s_per_trajectory_mean": tj.get("generation_s_per_trajectory_mean"),
+        "generation_s_slowest_trajectory": tj.get("generation_s_slowest_trajectory"),
+        "trajectories_on_multiple_replicas_share": tj.get("trajectories_on_multiple_replicas_share"),
+        "per_turn_latency_p95_s": gw.get("latency_p95_s"), "per_turn_latency_p99_s": gw.get("latency_p99_s"),
+        "requests_resumed_after_abort": gw.get("resumed_requests"), "request_share_cv_across_replicas": gw.get("server_request_cv"),
+        "ttft_mean_s": (rm.get("ttft") or {}).get("mean_s"), "queue_time_mean_s": (rm.get("queue") or {}).get("mean_s"),
+        "prefix_cache_hit_rate": rm.get("prefix_hit_rate"), "preemptions": rm.get("preemptions"),
+        "replicas_seen_in_stats_lines": ls.get("replicas"), "running_cv_across_replicas": ls.get("running_cv_mean"),
+        "idle_while_queued_share": ls.get("idle_while_queued_share"),
+        "notes": [b["note"] for b in g.values() if isinstance(b, dict) and b.get("note")] or None,
+    }
 
 def fmt(v):
     if isinstance(v, float): return f"{v:,.3f}" if abs(v) < 10 else f"{v:,.1f}"
@@ -103,7 +125,7 @@ def main():
     a = ap.parse_args(); r = build(Path(a.run_folder))
     if a.json: print(json.dumps(r, indent=2, default=str)); return
     print(f"# {r['run']}  outcome={r['outcome']}  training_steps={r['training_steps']}  means over steps {r['steps_averaged']}  topology={r['topology']}")
-    for sec in ("rl_convergence", "rl_efficiency", "rl_performance", "trajectories"):
+    for sec in ("rl_convergence", "rl_efficiency", "rl_performance", "generation", "trajectories"):
         print(f"\n## {sec}")
         for k, v in r[sec].items():
             if isinstance(v, dict): print(f"- {k}:"); [print(f"    {kk}: {fmt(vv)}") for kk, vv in v.items()]

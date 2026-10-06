@@ -54,21 +54,52 @@ fi
 # servers, weight-sync engine): `--var 'RAY_ENV_VARS=K=V K2=V2'` (space
 # separated; values may contain commas). Used by the repo-level experiments/ to flip NCCL
 # transports per run without touching the RayCluster pods.
-EXTRA_OVERRIDES=()
+EXTRA_OVERRIDES=(
+  # where the always-on rollout adapter writes its evidence (see below)
+  "+ray_kwargs.ray_init.runtime_env.env_vars.RLBENCH_RUN_OUT=\"$RUN_OUT\""
+)
 for kv in ${RAY_ENV_VARS:-}; do
   EXTRA_OVERRIDES+=("+ray_kwargs.ray_init.runtime_env.env_vars.${kv%%=*}=\"${kv#*=}\"")
 done
 
-# knobs for the repo-level experiments/. `--var RAY_DEDUP_LOGS=0`: Ray collapses worker log
-# lines that differ only in numbers; 0 keeps every rank's lines (read by the driver process,
-# i.e. this entrypoint's python, so a plain export is enough). `--var NO_HYBRID_ROLLOUT=1`:
+# knobs for the repo-level experiments/. RAY_DEDUP_LOGS: Ray collapses worker log lines that
+# differ only in numbers; 0 (the default here) keeps every rank's / replica's lines (read by the
+# driver process, i.e. this entrypoint's python, so a plain export is enough); `--var RAY_DEDUP_LOGS=1` restores collapsing. `--var NO_HYBRID_ROLLOUT=1`:
 # clean disaggregated layout (no hybrid vLLM replicas on the trainer GPUs) — honoured only by
 # the patched verl from experiments/gpu-host-offload; verl's trainer runs inside a Ray actor
 # (TaskRunnerV1), which sees runtime-env variables, not this shell's exports.
-export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
+# default 0 since the multi-replica rungs: vLLM's per-replica stats lines differ only in numbers and would be collapsed otherwise
+export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-0}
 if [ "${NO_HYBRID_ROLLOUT:-0}" = "1" ]; then
   EXTRA_OVERRIDES+=('+ray_kwargs.ray_init.runtime_env.env_vars.RLBENCH_NO_HYBRID_ROLLOUT="1"')
 fi
+
+# rlbench features (`rlbench run ... --feature <name>`): rlbench copies each
+# feature's config/ files flat into this directory; every feature-<name>.sh
+# fragment appends to EXTRA_OVERRIDES and/or exports env, nothing else changes.
+# ${RLBENCH_FEATURES} is baked at render time ("" when no feature is enabled).
+echo "rlbench features: '${RLBENCH_FEATURES:-}'"
+for frag in "$(dirname "$0")"/feature-*.sh; do
+  [ -e "$frag" ] || continue
+  echo "sourcing feature fragment $(basename "$frag")"
+  # shellcheck disable=SC1090
+  source "$frag"
+done
+
+# Generation-side evidence, identical in every run (feature or not):
+# - rlbench_verl_provider.rollout_adapter.RlbenchRolloutAdapter wraps uni-agent's
+#   AgentFrameworkRolloutAdapter: per-request records at the gateway
+#   (/data/outputs/<RUN_ID>/gateway-logs/*.jsonl) and periodic vLLM /metrics
+#   snapshots per replica (/data/outputs/<RUN_ID>/replica-metrics/), both pulled
+#   into the run folder by hooks/post-run.sh. The routing mode is selected by the
+#   RLBENCH_ROUTER runtime-env variable (default: verl's own balancer); features
+#   set it through their fragment, so arms differ only in routing.
+# - rollout.disable_log_stats=False: keeps vLLM's stats collection on, which is
+#   what populates each replica's /metrics (TTFT, queue time, prefix-cache
+#   counters) for the poller and for the scheduler's routing stats. The periodic
+#   INFO stats line itself stays hidden: verl starts the servers with
+#   VLLM_LOGGING_LEVEL=WARN (measured 2026-10-02), so the /metrics snapshots are
+#   the per-replica source of truth.
 
 # pre-download the model once (head) so workers only ever read the shared
 # cache: concurrent cross-node downloads onto Filestore cause NFS stale file
@@ -150,7 +181,8 @@ exec python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_parallel_calls=1 \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
     actor_rollout_ref.rollout.agent.num_workers="$AGENT_WORKERS" \
-    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=uni_agent.framework.entry.AgentFrameworkRolloutAdapter \
+    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=rlbench_verl_provider.rollout_adapter.RlbenchRolloutAdapter \
+    actor_rollout_ref.rollout.disable_log_stats=False \
     +actor_rollout_ref.rollout.custom.agent_framework.gateway_count="$GATEWAYS" \
     "+actor_rollout_ref.rollout.custom.agent_framework.log_dir=$AGENT_LOG_DIR" \
     +actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_fqn=uni_agent.framework.task_runner.run_task \

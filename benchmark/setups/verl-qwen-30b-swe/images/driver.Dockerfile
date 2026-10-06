@@ -13,6 +13,8 @@ ARG VERL_REF=adc7eefa16dad75c5f7b878823d5a76eac90c7b3
 # release/v0.9.0
 ARG UNI_AGENT_REF=9f7b024
 # last commit before Continuous-Token integration (#164), which requires verl>v0.9.0
+ARG PYIS_REF=291b31be078c88e28aa0dd00dc67f03d82d81312
+# py-inference-scheduler main @ 2026-09-23 (rlbench feature "inference-scheduler")
 
 RUN git clone --filter=blob:none https://github.com/verl-project/verl /opt/verl \
     && git -C /opt/verl checkout -q ${VERL_REF} \
@@ -86,7 +88,20 @@ else:
     raise SystemExit("swebench import still failing")
 EOF2
 
-# our provider (agent-sandbox Sandbox CRs) + r2e-gym task module
+# py-inference-scheduler (rlbench feature "inference-scheduler"): the package
+# proper is a src layout (pip -e), but its verl integration (integration/) and
+# backend patches (backends/) are plain top-level dirs outside the wheel, so the
+# repo root goes on PYTHONPATH. Present in every image so baseline and feature
+# runs share one image; only imported when the feature is on. Leaf deps only
+# (ray/fastapi/uvicorn come with the base), pinned to the base numpy/torch.
+RUN git clone --filter=blob:none https://github.com/llm-d-incubation/py-inference-scheduler /opt/py-inference-scheduler \
+    && git -C /opt/py-inference-scheduler checkout -q ${PYIS_REF} \
+    && pip install --no-deps -e /opt/py-inference-scheduler \
+    && pip freeze 2>/dev/null | grep -E '^(numpy|torch)==' > /tmp/base-pins.txt \
+    && pip install -c /tmp/base-pins.txt "prometheus-client>=0.20" "setproctitle>=1.3" "aiohttp>=3.9"
+ENV PYTHONPATH=/opt/py-inference-scheduler${PYTHONPATH:+:$PYTHONPATH}
+
+# our provider (agent-sandbox Sandbox CRs + rollout adapter) + r2e-gym task module
 COPY provider /opt/rlbench-verl/provider
 COPY tasks /opt/rlbench-verl/tasks
 RUN pip install -e /opt/rlbench-verl/provider -e /opt/rlbench-verl/tasks
@@ -117,5 +132,10 @@ from uni_agent.sandbox.registry import get_sandbox_cls
 assert get_sandbox_cls("agent_sandbox").provider == "agent_sandbox"
 from uni_agent.tasks.registry import get_task_cls
 assert get_task_cls("r2e_gym").name == "r2e_gym"
-print("verl + uni-agent + agent_sandbox provider + r2e_gym task: OK")
+# rollout adapter (always on) + py-inference-scheduler (feature): importable, modern verl layout detected
+import rlbench_verl_provider.rollout_adapter  # noqa
+from py_inference_scheduler import Scheduler  # noqa
+import integration.verl.verl_hook as hook
+assert hook._VERL_LAYOUT == "modern", hook._VERL_LAYOUT
+print("verl + uni-agent + agent_sandbox provider + r2e_gym task + rollout adapter + py-inference-scheduler: OK")
 EOF

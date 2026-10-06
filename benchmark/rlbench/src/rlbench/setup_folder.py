@@ -8,6 +8,7 @@ A setup folder follows the convention documented in benchmark/README.md:
       config/         # optional run configs passed with --config
       hooks/          # optional: pre-setup.sh, post-run.sh
       provision.sh    # optional one-time cluster prep, never run by rlbench
+      features/<n>/   # optional opt-in features (``--feature <n>``), see FeatureFolder
 
 Manifests may reference ``${VARS}``. Values come from the process environment
 plus rlbench built-ins (RUN_ID, RUN_NAME). Unresolved variables are an error:
@@ -56,21 +57,123 @@ class SetupFolder:
 
     def scrape_targets(self) -> list[tuple[str, str, str, str]]:
         """Optional ``scrape-targets.txt``: ``pods <namespace> <label-selector> <port> <path>`` per line."""
-        f = self.root / "scrape-targets.txt"
-        targets = []
-        if f.is_file():
-            for line in f.read_text().splitlines():
-                parts = line.split()
-                if not parts or parts[0].startswith("#"):
-                    continue
-                if parts[0] != "pods" or len(parts) != 5:
-                    raise SetupFolderError(f"{f}: expected 'pods <namespace> <selector> <port> <path>', got: {line!r}")
-                targets.append((parts[1], parts[2], parts[3], parts[4]))
-        return targets
+        return _parse_scrape_targets(self.root / "scrape-targets.txt")
 
     def hook(self, name: str) -> Path | None:
         p = self.root / "hooks" / name
         return p if p.is_file() else None
+
+    def feature(self, name: str) -> "FeatureFolder":
+        """Load ``features/<name>/`` (``--feature <name>``); unknown names fail before the cluster is touched."""
+        return FeatureFolder.load(self.root, name)
+
+
+@dataclass
+class FeatureFolder:
+    """An opt-in feature of a setup: ``<setup>/features/<name>/``.
+
+        features/<name>/
+          README.md            # what it is, requirements, how to verify it was active
+          vars.env             # KEY=VALUE render-time variables (env < vars.env < --var)
+          setup/*.yaml         # optional extra manifests, applied after the setup's
+          config/*             # optional files copied (flat) into the run config dir;
+                               #   convention: feature-<name>.sh fragment sourced by the job
+          hooks/{pre-setup,post-run}.sh   # optional, run after the setup's hooks
+          scrape-targets.txt   # optional, merged into the setup's targets
+
+    Features flip ``${VAR:-default}`` knobs of the base manifests and may add
+    objects; they never patch base objects. rlbench also sets the built-ins
+    ``RLBENCH_FEATURES`` (comma-joined) and ``FEATURE_<NAME>=1`` per feature.
+    """
+
+    name: str
+    root: Path
+    vars: dict[str, str] = field(default_factory=dict)
+    setup_manifests: list[Path] = field(default_factory=list)
+    config_files: list[Path] = field(default_factory=list)
+
+    _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+    @classmethod
+    def load(cls, setup_root: Path, name: str) -> "FeatureFolder":
+        if not cls._NAME_RE.match(name):
+            raise SetupFolderError(f"feature name must be lowercase [a-z0-9-]: {name!r}")
+        root = Path(setup_root) / "features" / name
+        if not root.is_dir():
+            available = sorted(p.name for p in (Path(setup_root) / "features").glob("*") if p.is_dir())
+            raise SetupFolderError(
+                f"unknown feature {name!r}: {root} not found"
+                + (f" (available: {', '.join(available)})" if available else "")
+            )
+        setup_dir = root / "setup"
+        config_dir = root / "config"
+        return cls(
+            name=name,
+            root=root,
+            vars=_parse_vars_env(root / "vars.env"),
+            setup_manifests=sorted(p for p in setup_dir.iterdir() if p.suffix in (".yaml", ".yml"))
+            if setup_dir.is_dir() else [],
+            config_files=sorted(p for p in config_dir.iterdir() if p.is_file()) if config_dir.is_dir() else [],
+        )
+
+    @property
+    def env_name(self) -> str:
+        """``FEATURE_<NAME>`` built-in: upper-case, dashes to underscores."""
+        return "FEATURE_" + self.name.upper().replace("-", "_")
+
+    def scrape_targets(self) -> list[tuple[str, str, str, str]]:
+        return _parse_scrape_targets(self.root / "scrape-targets.txt")
+
+    def hook(self, name: str) -> Path | None:
+        p = self.root / "hooks" / name
+        return p if p.is_file() else None
+
+
+def feature_builtins(features: list["FeatureFolder"]) -> dict[str, str]:
+    """Render-time built-ins describing the enabled features (always set, so
+    ``${RLBENCH_FEATURES}`` renders to "" when no feature is enabled)."""
+    out = {"RLBENCH_FEATURES": ",".join(f.name for f in features)}
+    for f in features:
+        out[f.env_name] = "1"
+    return out
+
+
+def feature_variables(features: list["FeatureFolder"]) -> dict[str, str]:
+    """Merged ``vars.env`` of all enabled features (later features win)."""
+    out: dict[str, str] = {}
+    for f in features:
+        out.update(f.vars)
+    return out
+
+
+def _parse_vars_env(path: Path) -> dict[str, str]:
+    """``KEY=VALUE`` per line, ``#`` comments and blank lines ignored; values are
+    taken verbatim (no quoting rules, no shell expansion)."""
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stripped):
+            raise SetupFolderError(f"{path}:{n}: expected KEY=VALUE, got {line!r}")
+        k, v = stripped.split("=", 1)
+        out[k] = v
+    return out
+
+
+def _parse_scrape_targets(f: Path) -> list[tuple[str, str, str, str]]:
+    targets = []
+    if f.is_file():
+        for line in f.read_text().splitlines():
+            parts = line.split()
+            if not parts or parts[0].startswith("#"):
+                continue
+            if parts[0] != "pods" or len(parts) != 5:
+                raise SetupFolderError(f"{f}: expected 'pods <namespace> <selector> <port> <path>', got: {line!r}")
+            targets.append((parts[1], parts[2], parts[3], parts[4]))
+    return targets
 
 
 # Render-time variables are BRACED ONLY: ``${NAME}`` or ``${NAME:-default}``.

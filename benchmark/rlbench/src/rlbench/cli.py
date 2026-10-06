@@ -1,7 +1,7 @@
 """rlbench: setup, run, and collect RL training benchmarks on the cluster
 kubectl currently points at.
 
-    rlbench run <setup-folder> [--config f] [--var K=V]... [--keep] [--out runs/] [--timeout 24h]
+    rlbench run <setup-folder> [--config f] [--feature NAME]... [--var K=V]... [--keep] [--out runs/] [--timeout 24h]
     rlbench cleanup <run-folder>
     rlbench collect <run-folder>
 """
@@ -21,7 +21,14 @@ import yaml
 from . import kube
 from .metrics import MetricsSampler
 from .runfolder import RunFolder
-from .setup_folder import SetupFolder, namespace_of, render_manifest, render_text_lenient
+from .setup_folder import (
+    SetupFolder,
+    feature_builtins,
+    feature_variables,
+    namespace_of,
+    render_manifest,
+    render_text_lenient,
+)
 
 DEFAULT_TIMEOUT_S = 24 * 3600
 READY_TIMEOUT_S = 60 * 60   # inference readiness includes model download + load
@@ -42,8 +49,11 @@ def _run_hook(hook: Path | None, env: dict[str, str]) -> None:
 
 def cmd_run(args: argparse.Namespace) -> int:
     setup = SetupFolder.load(args.setup_folder)
+    features = [setup.feature(n) for n in args.feature]  # unknown names fail here, before any run folder exists
     run = RunFolder.create(args.out, args.name or setup.root.name)
     print(f"run id: {run.run_id}\nrun folder: {run.path}")
+    if features:
+        print("features: " + ", ".join(f.name for f in features))
 
     extra: dict[str, str] = {}
     for item in args.var:
@@ -52,8 +62,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 1
         k, v = item.split("=", 1)
         extra[k] = v
-    variables = {**os.environ, **extra, "RUN_ID": run.run_id, "RUN_NAME": run.run_id}
+    # precedence: environment < feature vars.env < --var < built-ins
+    variables = {
+        **os.environ,
+        **feature_variables(features),
+        **extra,
+        "RUN_ID": run.run_id,
+        "RUN_NAME": run.run_id,
+        **feature_builtins(features),
+    }
     config_file = Path(args.config).resolve() if args.config else None
+    feature_config_files = [(f, c) for f in features for c in f.config_files]
+    if feature_config_files and config_file is not None and not config_file.is_dir():
+        print("error: feature config files need --config to be a directory (or no --config)")
+        return 1
 
     # Render everything up front: a template error should fail before the
     # cluster is touched, and the rendered manifests are the cleanup manifest.
@@ -62,6 +84,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         docs = render_manifest(m, variables)
         run.write_rendered(m.name, docs)
         setup_docs.extend(docs)
+    # feature manifests render after the setup's: "feature-<name>-<file>" sorts
+    # after the numbered base files, so they apply last and are deleted first
+    for f in features:
+        for m in f.setup_manifests:
+            docs = render_manifest(m, variables)
+            run.write_rendered(f"feature-{f.name}-{m.name}", docs)
+            setup_docs.extend(docs)
     job_docs = render_manifest(setup.job_manifest, variables)
     job_path = run.write_rendered("job.yaml", job_docs)
     namespace = namespace_of(setup_docs + job_docs)
@@ -72,27 +101,28 @@ def cmd_run(args: argparse.Namespace) -> int:
     job_name = jobs[0]["metadata"]["name"]
 
     run.record_setup_ref(setup.root)
+    run.record_features(features)
     run.record_cluster_identity()
 
     # Run configs are templated like manifests (e.g. per-run output dirs);
     # the rendered copy in the run folder is exactly what ran.
-    rendered_config: Path | None = None
-    if config_file:
-        rendered_config = run.config / config_file.name
-        if config_file.is_dir():
-            rendered_config.mkdir(exist_ok=True)
-            for f in sorted(config_file.iterdir()):
-                if f.is_file():
-                    (rendered_config / f.name).write_text(render_text_lenient(f, variables))
-        else:
-            rendered_config.write_text(render_text_lenient(config_file, variables))
+    try:
+        rendered_config = _render_run_config(run.config, config_file, feature_config_files, variables)
+    except ValueError as e:
+        print(f"error: {e}")
+        return 1
 
+    pod_targets = setup.scrape_targets()
+    for f in features:
+        pod_targets += f.scrape_targets()
     streamer = kube.LogStreamer(namespace, run.run_id, run.logs)
-    sampler = MetricsSampler(namespace, run.metrics, pod_targets=setup.scrape_targets())
+    sampler = MetricsSampler(namespace, run.metrics, pod_targets=pod_targets)
+    hook_env = {"RUN_ID": run.run_id, "NAMESPACE": namespace, "RLBENCH_FEATURES": variables["RLBENCH_FEATURES"]}
     outcome = "SetupFailed"
     job_status: dict = {}
     try:
-        _run_hook(setup.hook("pre-setup.sh"), {"RUN_ID": run.run_id, "NAMESPACE": namespace})
+        for owner in (setup, *features):  # setup hook first, then features in --feature order
+            _run_hook(owner.hook("pre-setup.sh"), hook_env)
 
         print(f"--> applying setup to namespace {namespace}")
         for p in sorted(run.rendered.iterdir()):
@@ -133,14 +163,43 @@ def cmd_run(args: argparse.Namespace) -> int:
         streamer.stop()
         kube.dump_events(namespace, run.events)
         run.mark("collected")
-        run.write_result(outcome, {"namespace": namespace, "job_status": job_status})
-        _run_hook(setup.hook("post-run.sh"), {"RUN_ID": run.run_id, "NAMESPACE": namespace,
-                                              "RUN_FOLDER": str(run.path)})
+        run.write_result(outcome, {"namespace": namespace, "features": [f.name for f in features],
+                                   "job_status": job_status})
+        for owner in (setup, *features):
+            _run_hook(owner.hook("post-run.sh"), {**hook_env, "RUN_FOLDER": str(run.path)})
         if args.keep:
             print(f"--> --keep: leaving resources in namespace {namespace}")
         else:
             _cleanup_rendered(run.rendered)
     return 0 if outcome == "Complete" else 1
+
+
+def _render_run_config(config_dir: Path, config_file: Path | None,
+                       feature_config_files: list[tuple], variables: dict[str, str]) -> Path | None:
+    """Render the ``--config`` file/dir plus every feature's ``config/*`` into
+    the run folder; returns the path that becomes ConfigMap ``rlbench-run-config``.
+
+    Feature files land flat next to the run config (ConfigMap keys are flat);
+    a feature may not shadow a run-config file or another feature's file."""
+    rendered_config: Path | None = None
+    if config_file:
+        rendered_config = config_dir / config_file.name
+        if config_file.is_dir():
+            rendered_config.mkdir(exist_ok=True)
+            for f in sorted(config_file.iterdir()):
+                if f.is_file():
+                    (rendered_config / f.name).write_text(render_text_lenient(f, variables))
+        else:
+            rendered_config.write_text(render_text_lenient(config_file, variables))
+    elif feature_config_files:
+        rendered_config = config_dir / "run-config"
+        rendered_config.mkdir(exist_ok=True)
+    for feat, c in feature_config_files:
+        target = rendered_config / c.name
+        if target.exists():
+            raise ValueError(f"feature {feat.name!r} config file {c.name!r} collides with an existing run config file")
+        target.write_text(render_text_lenient(c, variables))
+    return rendered_config
 
 
 def _cleanup_rendered(rendered_dir: Path) -> None:
@@ -204,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
     p_run = sub.add_parser("run", help="set up, run the job, collect, clean up")
     p_run.add_argument("setup_folder")
     p_run.add_argument("--config", help="run config file, exposed in-cluster as ConfigMap 'rlbench-run-config'")
+    p_run.add_argument("--feature", action="append", default=[], metavar="NAME",
+                       help="enable <setup>/features/NAME (repeatable); recorded in config/features.json")
     p_run.add_argument("--keep", action="store_true", help="skip cleanup after the run")
     p_run.add_argument("--var", action="append", default=[], metavar="KEY=VALUE",
                        help="extra render-time variable for ${KEY} in manifests/configs (repeatable)")

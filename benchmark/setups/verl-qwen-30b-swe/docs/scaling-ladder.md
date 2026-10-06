@@ -14,6 +14,7 @@ barrier that rung introduces. Numbers come from the rlbench run folders
 | h200-t8-s1  | 1×8 (TP2·CP1·EP4, DP1) | 1 GPU, TP1 | 16 × 8 | 24  | single-node trainer, single-GPU sampler |
 | h200-t8-s2  | 1×8 (same)             | 2 GPU, TP2 | 32 × 8 | 48  | multi-GPU sampler |
 | h200-t16-s8 | 2×8 (TP2·CP1·EP4, DP2) | 8 GPU, TP8 | 64 × 8 | 128 | multi-node trainer (DP only crosses nodes) |
+| h200-t16-s4x2 | 2×8 (same) | 4 replicas × 2 GPU (TP2) | 64 × 8 | 128 | multi-replica sampler: every policy request is routed to one of 4 engines (the rung request-routing features are measured on; baseline = verl's session-sticky balancer) |
 
 ## Per-step timings (seconds; 2-step runs show step1 / step2; supplementary 10-step rows show mean over steps 2..10)
 
@@ -25,6 +26,7 @@ barrier that rung introduces. Numbers come from the rlbench run folders
 | **h200-t8-s2** (2-step, canonical) | `20260930-093817-h200-t8-s2-smoke` | 572 / 564 | 145 / 136 | 320 / 324 | 12 | 1050 / 1038 | 5.3% / 6.7% | 0.148 / 0.008 | 0 / 0.22 | TP2 sampler: 256 episodes/batch in ~570s (≈2.4× rung-1 throughput); training 1.25 s/sample; trainer busy ≈45% of step |
 | h200-t8-s2 (10-step, supplementary) | `20260930-103431-h200-t8-s2-bench` | 498 | 124 | 286 | 13 | 922 | 6.3% | 0.072 | 0.207 | 10/10 steps in 2h47m; trainer busy ≈46% of step; TP2 sampler ≈2× rung-1 batch in less time; response mean 11899 tok, ~10 turns; ~2 tasks/batch lost to the litellm cwd bug (fixed in tool v2 for rung 3) |
 | **h200-t16-s8** (2-step, canonical) | `20260930-132837-h200-t16-s8-smoke` | 458 / 305 | 139 / 133 | 324 / 322 | 12.6 | 937 / 776 | 5.6% / 5.9% | 0.096 / 0.061 | 0 / 0.28 | 512/512 sessions both batches, **0 failures** (tool v2); 16-GPU DP2 trainer: 0.63 s/sample (half of the 8-GPU rungs) → near-linear across nodes with EP on-node; 14× faster than the cross-node-EP baseline on identical hardware; weight sync 16→8 GPUs unchanged at ~12.6s; 128 concurrent sandboxes sustained |
+| **h200-t16-s4x2** (2-step, canonical, VAL_TASKS=0, image v9) | `20261005-161446-h200-t16-s4x2` | 340 / 90 | 148 / 137 | 327 / 337 | 13 | 839 / 581 | 5.4% / 5.4% | 0.088 / 0.100 | 0 / 0.36 | sampler as 4 replicas × TP2 (same GPUs as rung 3's TP8): 512 episodes/batch over 4 engines, per-turn latency p50 9.1 s / p95 49 s / p99 78 s at the gateway, TTFT 0.21 s, queue time 0.02 s, prefix-cache hit 0.94, replica request share CV 0.013 — engines never queue at 128 sessions (KV 9 % used); step 2 581 s vs 776 s for TP8 (smaller TP = less collective overhead per token, more concurrent engines); a cold-start repeat on image v7 gave 632 s (`20261002-150931-h200-t16-s4x2`), i.e. ±8 % run-to-run |
 | h200-t16-s8 (2-step **+ SWE-bench Verified validation**, metrics e2e) | `20260930-152518-h200-t16-s8-val` | 438 / 243 | 146 / 135 | 321 / 327 | 13 | 922 / 722 | 5.8% / 6.0% | 0.070 / 0.078 | 0 / 0.29 | same topology + 100-instance Verified val at step 0 and step 2 (acc **0.10 → 0.08**, 100/100 graded each pass, 0 session failures of 1736); step-2 `gen` 243s because the async sampler overlapped step-1 training; 100 min wall incl. ~32 min cold init + 2 × ~14-27 min val passes |
 
 ## Per-rung observations
@@ -35,6 +37,17 @@ barrier that rung introduces. Numbers come from the rlbench run folders
 - **h200-t8-s2**: smoke Batch 1: 248/256 sessions; the 8 failures were all one uid ("empty trajectories" for every rollout of a single task — a per-task env issue, group dropped by GRPO); batch 2: 0 failures. Sampler scale-up beat linear: 256 episodes generated in 572s at TP2 vs 128 in ~700s at TP1 (≈2.4× throughput on 2× GPUs; bigger KV budget → 48 concurrent sessions).
 - **h200-t16-s8**: PASSED (2-step run, 35 min wall). The multi-node barrier crossed cleanly: cross-node traffic is only the DP=2 gradient all-reduce, and `update_actor` per sample dropped from 1.17-1.25 s (8 GPUs) to 0.63 s (16 GPUs). Generation at TP8 with 128 sessions: 512 episodes in 305-458s — the trainer is now busy ≈60% of the step (133+322+13 of 776s), i.e. the ladder moved the system from generation-bound (rung 1, 21%) toward balanced. Zero session failures across 1024 episodes with tool image v2. Ray placed the 16 trainer ranks on the "rollout" pod + one "trainer" pod and vLLM on the other trainer pod — harmless because the worker groups are identical.
 
+- **h200-t16-s4x2**: PASSED (2-step, 31 min job window warm). The 4 × TP2 sampler beats
+  the TP8 single replica on step time (581 vs 776 s) with the same 8 GPUs; the gateway and
+  engine evidence (new in these runs) shows the sampler is far from saturated at 128
+  sessions: no engine ever reports a waiting request, KV usage ~9 %, prefix-cache hit
+  rate 0.94 thanks to verl's session-sticky routing. First feature measured on this
+  rung: `--feature inference-scheduler` (see `experiments/inference-scheduler/`), two
+  profiles, both worse than the baseline at this load: the repo's backpressure profile
+  re-routes 38 % of trajectories mid-session (prefix hits 0.885, step 2 +8 %); upstream's
+  prefix-only profile keeps stickiness (0.934) but balances at task granularity with a
+  per-gateway load view, leaving two replicas with twice the work of the other two
+  (request share CV 0.34, per-turn p99 +19 %, slowest trajectory +24 %, step 2 +10 %).
 - **h200-t16-s8 + validation (metrics e2e)**: PASSED — every metric in the
   benchmark question list is produced from the run folder by
   `tools/run_report.py`. Headline numbers (step 2 unless noted):
