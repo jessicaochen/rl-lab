@@ -8,8 +8,20 @@ particular run folder, never in ad-hoc cluster inspection after the fact.
 
 Recorded runs are **not checked in** (enforced by the `.gitignore` in this
 directory): logs and metrics can contain PII and cluster identifiers
-(project ids, node names, usernames). Runs are backed up to external storage
-instead — the repo only carries this README and the ignore rules.
+(project ids, node names, usernames). Runs are backed up to a GCS bucket
+instead — the repo only carries this README, the ignore rules and `sync.sh`.
+
+## Backup: `sync.sh`
+
+```
+RUNS_BUCKET=<bucket> [PROJECT=<gcp-project>] ./sync.sh [--dry-run]
+```
+
+Two-way, never deletes: pushes local runs missing from the bucket and pulls
+bucket runs missing here. A run counts as present only once its `result.json`
+exists (rlbench writes it last, and so does the script), so in-progress runs
+are never pushed and an interrupted transfer is resumed on the next call.
+The bucket name is cluster-specific and lives only in your environment.
 
 ## Expected structure
 

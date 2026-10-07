@@ -17,7 +17,7 @@ rlbench collect <run-folder>            # (re-)collect artifacts from a live/fin
 - Operates on whatever cluster `kubectl` currently points at.
 - `--keep` skips cleanup after the run (default: clean up everything the tool created).
 - `--feature <name>` (repeatable) opts the run into `<setup>/features/<name>/` — see *Features* below. Everything else about the run stays identical, which is what makes baseline-vs-feature runs comparable.
-- Every run gets a run folder `runs/<timestamp>-<name>/` — the single source of truth for analysis. See `runs/README.md`; run folders are never committed (PII) and are backed up externally.
+- Every run gets a run folder `runs/<timestamp>-<name>/` — the single source of truth for analysis. See `runs/README.md`; run folders are never committed (PII); `runs/sync.sh` backs them up to a bucket named by `RUNS_BUCKET`.
 
 ## Setup folder contract
 
