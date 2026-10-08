@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""lease: cooperative exclusive lease on a shared Kubernetes cluster's hardware.
+
+One Lease object (coordination.k8s.io/v1) in a well-known namespace says who may
+use the hardware right now. Agents acquire it before touching the cluster, a
+background loop renews it while they work, and they release it after cleaning
+up. Crashed holders expire; takeover is a compare-and-swap on resourceVersion,
+so two agents racing for an expired lease cannot both win.
+
+    lease status                      who holds it, since when, is the cluster clean
+    lease acquire --purpose "..."     take it (auto-provisions namespace on first use)
+    lease renew [--loop]              heartbeat (acquire starts --loop for you)
+    lease release [--force]           verify cleanup, then free it
+    lease check                       list hardware-using leftovers
+    lease init                        provision namespace + Role (idempotent)
+
+Exit codes: 0 ok, 1 error, 2 held by someone else, 3 cluster dirty.
+Only the standard library and kubectl are used. See README.md.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+NS = os.environ.get("LEASE_NAMESPACE", "cluster-lease")
+NAME = os.environ.get("LEASE_NAME", "hardware")
+TTL = int(os.environ.get("LEASE_TTL", "900"))
+MAX_HOLD = int(os.environ.get("LEASE_MAX_HOLD", str(12 * 3600)))  # renew loop gives up after this; lease then expires
+HOLDER = os.environ.get("LEASE_HOLDER") or f"{os.environ.get('USER', 'unknown')}@{socket.gethostname().split('.')[0]}"
+CONTACT = os.environ.get("LEASE_CONTACT", "")
+KUBECTL = os.environ.get("KUBECTL", "kubectl")
+SYSTEM_NS_PREFIXES = tuple(os.environ.get("LEASE_SYSTEM_NS", "kube-,gke-,gmp-,cluster-lease").split(","))
+CHECK_KINDS = [k for k in os.environ.get("LEASE_CHECK_KINDS", "rayclusters,rayjobs,sandboxes").split(",") if k]
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache"), "cluster-lease")
+ANN = "cluster-lease/"  # annotation key prefix
+
+EXIT_OK, EXIT_ERR, EXIT_HELD, EXIT_DIRTY = 0, 1, 2, 3
+
+
+# ---------------------------------------------------------------- kubectl ----
+class KubeError(Exception):
+    def __init__(self, stderr, code):
+        super().__init__(stderr.strip())
+        self.stderr, self.code = stderr, code
+
+    @property
+    def already_exists(self):
+        return "AlreadyExists" in self.stderr or "already exists" in self.stderr
+
+    @property
+    def not_found(self):
+        return "NotFound" in self.stderr or "not found" in self.stderr
+
+    @property
+    def conflict(self):
+        return "Conflict" in self.stderr or "the object has been modified" in self.stderr
+
+    @property
+    def no_such_kind(self):
+        return "doesn't have a resource type" in self.stderr
+
+    @property
+    def forbidden(self):
+        return "Forbidden" in self.stderr or "forbidden" in self.stderr
+
+
+def kubectl(*args, stdin=None):
+    p = subprocess.run([KUBECTL, *args], input=stdin, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise KubeError(p.stderr, p.returncode)
+    return p.stdout
+
+
+def kubectl_json(*args, stdin=None):
+    out = kubectl(*args, "-o", "json", stdin=stdin)
+    return json.loads(out) if out.strip() else {}
+
+
+def die(msg, code=EXIT_ERR):
+    print(f"lease: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def context():
+    try:
+        return kubectl("config", "current-context").strip()
+    except KubeError:
+        return "?"
+
+
+# ------------------------------------------------------------------- time ----
+def now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def fmt(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def parse(s):
+    if not s:
+        return None
+    s = s.rstrip("Z")
+    f = "%Y-%m-%dT%H:%M:%S.%f" if "." in s else "%Y-%m-%dT%H:%M:%S"
+    return dt.datetime.strptime(s, f).replace(tzinfo=dt.timezone.utc)
+
+
+def ago(t):
+    if t is None:
+        return "never"
+    s = int((now() - t).total_seconds())
+    return f"{s}s ago" if s < 120 else f"{s // 60}m ago" if s < 7200 else f"{s // 3600}h ago"
+
+
+# ----------------------------------------------------------- provisioning ----
+ROLE = {
+    "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+    "metadata": {"name": "cluster-lease-user", "namespace": NS},
+    "rules": [{"apiGroups": ["coordination.k8s.io"], "resources": ["leases"],
+               "verbs": ["get", "list", "watch", "create", "update", "patch"]}],
+}
+
+
+def ensure_provisioned(verbose=True):
+    """Create the namespace and Role if missing. Safe to run concurrently."""
+    created = []
+    try:
+        kubectl("get", "namespace", NS)
+    except KubeError as e:
+        if not e.not_found:
+            die(f"cannot read namespace {NS}: {e}")
+        try:
+            kubectl("create", "namespace", NS)
+            created.append(f"namespace/{NS}")
+        except KubeError as e2:
+            if not e2.already_exists:
+                die(f"cannot create namespace {NS}: {e2}")
+    try:
+        kubectl("get", "role", "-n", NS, ROLE["metadata"]["name"])
+    except KubeError as e:
+        if e.not_found:
+            try:
+                kubectl("apply", "-f", "-", stdin=json.dumps(ROLE))
+                created.append(f"role/{ROLE['metadata']['name']}")
+            except KubeError as e2:
+                print(f"lease: warning: could not create Role (non-admin identities will need it): {e2}", file=sys.stderr)
+    if created and verbose:
+        print(f"lease: provisioned {', '.join(created)} in context {context()}")
+    return created
+
+
+# -------------------------------------------------------------- the lease ----
+def read_lease():
+    try:
+        return kubectl_json("get", "lease", "-n", NS, NAME)
+    except KubeError as e:
+        if e.not_found:
+            return None
+        die(f"cannot read lease {NS}/{NAME}: {e}")
+
+
+def lease_obj(holder, acquire_time, transitions, annotations, resource_version=None):
+    meta = {"name": NAME, "namespace": NS, "annotations": annotations}
+    if resource_version:
+        meta["resourceVersion"] = resource_version
+    return {"apiVersion": "coordination.k8s.io/v1", "kind": "Lease", "metadata": meta,
+            "spec": {"holderIdentity": holder, "leaseDurationSeconds": TTL,
+                     "acquireTime": fmt(acquire_time), "renewTime": fmt(now()),
+                     "leaseTransitions": transitions}}
+
+
+def holder_of(lease):
+    return (lease or {}).get("spec", {}).get("holderIdentity") or ""
+
+
+def annotations_of(lease):
+    return dict((lease or {}).get("metadata", {}).get("annotations") or {})
+
+
+def expiry_of(lease):
+    spec = lease.get("spec", {})
+    t = parse(spec.get("renewTime") or spec.get("acquireTime"))
+    return t + dt.timedelta(seconds=spec.get("leaseDurationSeconds") or TTL) if t else None
+
+
+def is_expired(lease):
+    e = expiry_of(lease)
+    return e is None or e < now()
+
+
+def cas_replace(obj):
+    """Replace with resourceVersion precondition. Raises KubeError(conflict) if someone else changed it first."""
+    return kubectl_json("replace", "-f", "-", stdin=json.dumps(obj))
+
+
+# ---------------------------------------------------------- cleanup check ----
+def is_system_ns(ns):
+    return any(ns.startswith(p) for p in SYSTEM_NS_PREFIXES)
+
+
+def gpu_count(pod):
+    n = 0
+    spec = pod.get("spec", {})
+    for c in spec.get("containers", []) + spec.get("initContainers", []):
+        r = c.get("resources", {})
+        for k in ("limits", "requests"):
+            v = r.get(k, {}).get("nvidia.com/gpu")
+            if v:
+                try:
+                    n = max(n, int(v))
+                except ValueError:
+                    n = max(n, 1)
+    return n
+
+
+def leftovers():
+    """Resources that mean someone is still using (or forgot to free) the hardware."""
+    found = []
+    for p in kubectl_json("get", "pods", "-A").get("items", []):
+        ns, name = p["metadata"]["namespace"], p["metadata"]["name"]
+        if is_system_ns(ns) or p.get("status", {}).get("phase") in ("Succeeded", "Failed"):
+            continue
+        g = gpu_count(p)
+        if g:
+            found.append(f"pod {ns}/{name} ({g} gpu, {p.get('status', {}).get('phase', '?')})")
+    for kind in CHECK_KINDS:
+        try:
+            items = kubectl_json("get", kind, "-A").get("items", [])
+        except KubeError as e:
+            if not e.no_such_kind:
+                print(f"lease: warning: cannot list {kind}: {e}", file=sys.stderr)
+            continue
+        for it in items:
+            ns = it["metadata"].get("namespace", "")
+            if not is_system_ns(ns):
+                found.append(f"{kind} {ns}/{it['metadata']['name']}")
+    return found
+
+
+def print_leftovers(items, limit=25):
+    for l in items[:limit]:
+        print(f"  - {l}")
+    if len(items) > limit:
+        print(f"  ... and {len(items) - limit} more")
+
+
+# ---------------------------------------------------------- renew daemon ----
+def pidfile():
+    return os.path.join(STATE_DIR, f"{NAME}.renew.pid")
+
+
+def logfile():
+    return os.path.join(STATE_DIR, f"{NAME}.renew.log")
+
+
+def start_renew_daemon(watch_pid):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    stop_renew_daemon(quiet=True)
+    log = open(logfile(), "a")
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "renew", "--loop", "--watch-pid", str(watch_pid)],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         start_new_session=True, env=os.environ.copy())
+    with open(pidfile(), "w") as f:
+        f.write(str(p.pid))
+    return p.pid
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def stop_renew_daemon(quiet=False):
+    try:
+        pid = int(open(pidfile()).read().strip())
+    except (FileNotFoundError, ValueError):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        if not quiet:
+            print(f"lease: stopped renew loop (pid {pid})")
+    except ProcessLookupError:
+        pass
+    try:
+        os.remove(pidfile())
+    except FileNotFoundError:
+        pass
+
+
+# ------------------------------------------------------------------ verbs ----
+def describe(lease, leftover_list=None):
+    print(f"context : {context()}")
+    print(f"lease   : {NS}/{NAME}")
+    a = annotations_of(lease)
+    if lease is None:
+        print("holder  : (none, lease not created yet)")
+    elif not holder_of(lease):
+        print(f"holder  : (free) last held by {a.get(ANN + 'previous-holder', '?')}, "
+              f"released {ago(parse(a.get(ANN + 'released-at')))}, cleanup {a.get(ANN + 'cleanup-status', '?')}")
+    else:
+        exp = expiry_of(lease)
+        state = "EXPIRED" if is_expired(lease) else f"expires in {int((exp - now()).total_seconds())}s"
+        me = " (you)" if holder_of(lease) == HOLDER else ""
+        print(f"holder  : {holder_of(lease)}{me}")
+        print(f"purpose : {a.get(ANN + 'purpose', '')}")
+        if a.get(ANN + "contact"):
+            print(f"contact : {a.get(ANN + 'contact')}")
+        print(f"acquired: {ago(parse(lease['spec'].get('acquireTime')))}   "
+              f"renewed: {ago(parse(lease['spec'].get('renewTime')))}   {state}")
+        if a.get(ANN + "cleanup-status") == "dirty":
+            print(f"note    : acquired over a dirty cluster left by {a.get(ANN + 'previous-holder', '?')}")
+    if leftover_list is not None:
+        print(f"cluster : {'clean' if not leftover_list else f'{len(leftover_list)} hardware-using resource(s)'}")
+        print_leftovers(leftover_list)
+
+
+def cmd_status(args):
+    ensure_provisioned()
+    lease = read_lease()
+    lo = None if args.no_check else leftovers()
+    describe(lease, lo)
+    h = holder_of(lease)
+    if h and h != HOLDER and not is_expired(lease):
+        sys.exit(EXIT_HELD)
+
+
+def cmd_check(args):
+    lo = leftovers()
+    if lo:
+        print(f"lease: {len(lo)} hardware-using resource(s):")
+        print_leftovers(lo, limit=1000)
+        sys.exit(EXIT_DIRTY)
+    print("lease: cluster is clean")
+
+
+def cmd_init(args):
+    created = ensure_provisioned(verbose=False)
+    print(f"lease: {'provisioned ' + ', '.join(created) if created else 'already provisioned'} ({NS}, context {context()})")
+
+
+def cmd_acquire(args):
+    ensure_provisioned()
+    ann = {ANN + "purpose": args.purpose, ANN + "contact": CONTACT,
+           ANN + "acquired-by-cmd": " ".join(sys.argv[1:])}
+    deadline = time.time() + (args.wait or 0)
+    while True:
+        lease = read_lease()
+        try:
+            if lease is None:
+                lease = kubectl_json("create", "-f", "-", stdin=json.dumps(lease_obj(HOLDER, now(), 0, ann)))
+                break
+            prev, prev_ann = holder_of(lease), annotations_of(lease)
+            transitions = lease.get("spec", {}).get("leaseTransitions") or 0
+            rv = lease["metadata"]["resourceVersion"]
+            if prev == HOLDER:  # idempotent re-acquire: refresh purpose and renewTime
+                lease = cas_replace(lease_obj(HOLDER, parse(lease["spec"].get("acquireTime")) or now(),
+                                              transitions, {**prev_ann, **ann}, rv))
+                break
+            if prev == "" or is_expired(lease):
+                if prev == "":  # cleanly (or forcibly) released: carry the release record forward
+                    carry = {ANN + "previous-holder": prev_ann.get(ANN + "previous-holder", ""),
+                             ANN + "cleanup-status": prev_ann.get(ANN + "cleanup-status", "unknown"),
+                             ANN + "previous-leftovers": prev_ann.get(ANN + "leftovers", "")}
+                else:  # holder died without releasing
+                    carry = {ANN + "previous-holder": prev, ANN + "cleanup-status": "unknown (previous holder expired)",
+                             ANN + "previous-leftovers": ""}
+                last = ago(parse(lease["spec"].get("renewTime")))
+                lease = cas_replace(lease_obj(HOLDER, now(), transitions + 1, {**carry, **ann}, rv))
+                if prev:
+                    print(f"lease: took over EXPIRED lease from {prev} (last renewed {last})")
+                break
+            # held by someone else and alive
+            if time.time() < deadline:
+                time.sleep(min(30, max(5, TTL // 30)))
+                continue
+            describe(lease)
+            print(f"\nlease: held by {prev}; not touching the cluster. "
+                  "Re-run with --wait SECONDS to queue, or contact the holder.", file=sys.stderr)
+            sys.exit(EXIT_HELD)
+        except KubeError as e:
+            if e.already_exists or e.conflict:
+                time.sleep(1)  # lost a race; re-read and decide again
+                continue
+            if e.forbidden:
+                die(f"permission denied on leases in {NS}; ask an admin to bind Role cluster-lease-user to you: {e}")
+            die(f"acquire failed: {e}")
+
+    watch = os.getppid() if args.watch_pid is None else args.watch_pid
+    pid = None if args.no_renew else start_renew_daemon(watch)
+    renew_note = (f", renew loop pid {pid}" + (f" tied to pid {watch}" if watch else "") if pid
+                  else f", NO renew loop: run `lease renew` at least every {TTL // 3}s")
+    print(f"lease: acquired {NS}/{NAME} as {HOLDER} (ttl {TTL}s{renew_note})")
+    lo = leftovers()
+    if lo:
+        prev_holder = annotations_of(lease).get(ANN + "previous-holder") or "an unknown party (predates the lease)"
+        try:  # record the dirt on the lease so status/history show it
+            cur = read_lease()
+            cas_replace(lease_obj(HOLDER, parse(cur["spec"]["acquireTime"]), cur["spec"].get("leaseTransitions") or 0,
+                                  {**annotations_of(cur), ANN + "cleanup-status": "dirty",
+                                   ANN + "leftovers-at-acquire": "; ".join(lo)[:4000]},
+                                  cur["metadata"]["resourceVersion"]))
+        except (KubeError, KeyError, TypeError):
+            pass
+        print(f"lease: WARNING cluster is dirty, {len(lo)} hardware-using resource(s) left by {prev_holder}:")
+        print_leftovers(lo)
+        if not args.adopt_dirty:
+            print("lease: you hold the lease, so you may delete these. Clean up (or re-run with --adopt-dirty) before starting work.")
+            sys.exit(EXIT_DIRTY)
+        print("lease: --adopt-dirty given; proceeding, you now own these resources.")
+
+
+def renew_once():
+    lease = read_lease()
+    if lease is None:
+        return "gone"
+    if holder_of(lease) != HOLDER:
+        return f"lost to {holder_of(lease) or '(free)'}"
+    try:
+        new = dict(lease)
+        new["spec"] = {**lease["spec"], "renewTime": fmt(now()), "leaseDurationSeconds": TTL}
+        cas_replace(new)
+        return "ok"
+    except KubeError as e:
+        return "conflict" if e.conflict else f"error: {e}"
+
+
+def cmd_renew(args):
+    if not args.loop:
+        r = renew_once()
+        print(f"lease: renew {r}")
+        sys.exit(EXIT_OK if r in ("ok", "conflict") else EXIT_ERR)
+    interval = max(5, TTL // 3)
+    started = time.time()
+    print(f"[{fmt(now())}] renew loop for {NS}/{NAME} as {HOLDER} every {interval}s"
+          f"{f', exits when pid {args.watch_pid} is gone' if args.watch_pid else ''}, max hold {MAX_HOLD}s", flush=True)
+    while True:
+        if args.watch_pid and not pid_alive(args.watch_pid):
+            print(f"[{fmt(now())}] pid {args.watch_pid} is gone; stopping renewals so the lease expires in <= {TTL}s", flush=True)
+            sys.exit(EXIT_OK)
+        if time.time() - started > MAX_HOLD:
+            print(f"[{fmt(now())}] LEASE_MAX_HOLD ({MAX_HOLD}s) reached; stopping renewals so the lease expires", flush=True)
+            sys.exit(EXIT_OK)
+        r = renew_once()
+        if r == "gone" or r.startswith("lost"):
+            print(f"[{fmt(now())}] lease {r}; exiting", flush=True)
+            sys.exit(EXIT_HELD)
+        if r != "ok":
+            print(f"[{fmt(now())}] renew {r}", flush=True)
+        time.sleep(interval)
+
+
+def cmd_release(args):
+    lease = read_lease()
+    if lease is None or not holder_of(lease):
+        stop_renew_daemon(quiet=True)
+        print("lease: already free")
+        return
+    if holder_of(lease) != HOLDER:
+        describe(lease)
+        die(f"held by {holder_of(lease)}, not by you ({HOLDER}); refusing to release", EXIT_HELD)
+    lo = leftovers()
+    if lo and not args.force:
+        print(f"lease: NOT released: {len(lo)} hardware-using resource(s) still present. "
+              "Clean up first (or --force to release dirty):")
+        print_leftovers(lo)
+        sys.exit(EXIT_DIRTY)
+    stop_renew_daemon()
+    a = annotations_of(lease)
+    ann = {ANN + "previous-holder": HOLDER, ANN + "previous-purpose": a.get(ANN + "purpose", ""),
+           ANN + "released-at": fmt(now()), ANN + "cleanup-status": "dirty" if lo else "clean",
+           ANN + "leftovers": "; ".join(lo)[:4000]}
+    obj = lease_obj("", parse(lease["spec"].get("acquireTime")) or now(), lease["spec"].get("leaseTransitions") or 0,
+                    ann, lease["metadata"]["resourceVersion"])
+    try:
+        cas_replace(obj)
+    except KubeError as e:
+        die(f"release failed ({'modified concurrently, re-run' if e.conflict else e})")
+    print(f"lease: released {NS}/{NAME}" + (f" DIRTY with {len(lo)} leftover(s) recorded on the lease" if lo else " (cluster clean)"))
+
+
+# ------------------------------------------------------------------- main ----
+def main():
+    ap = argparse.ArgumentParser(prog="lease", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("status", help="show holder and cluster cleanliness")
+    s.add_argument("--no-check", action="store_true", help="skip the leftovers scan")
+    s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("acquire", help="take the lease")
+    s.add_argument("--purpose", required=True, help="what you are about to do (shown to anyone blocked by you)")
+    s.add_argument("--wait", type=int, metavar="SECONDS", help="poll until free for up to this long")
+    s.add_argument("--adopt-dirty", action="store_true", help="proceed even if leftovers are present (you own them now)")
+    s.add_argument("--no-renew", action="store_true", help="do not start the background renew loop")
+    s.add_argument("--watch-pid", type=int, metavar="PID",
+                   help="renew loop stops when this pid exits (default: your shell; 0 = never, rely on --max-hold)")
+    s.set_defaults(fn=cmd_acquire)
+    s = sub.add_parser("renew", help="heartbeat once, or --loop forever")
+    s.add_argument("--loop", action="store_true")
+    s.add_argument("--watch-pid", type=int, default=0, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_renew)
+    s = sub.add_parser("release", help="verify cleanup and free the lease")
+    s.add_argument("--force", action="store_true", help="release even if leftovers remain (recorded as dirty)")
+    s.set_defaults(fn=cmd_release)
+    s = sub.add_parser("check", help="list hardware-using leftovers")
+    s.set_defaults(fn=cmd_check)
+    s = sub.add_parser("init", help="provision namespace and Role (idempotent)")
+    s.set_defaults(fn=cmd_init)
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
