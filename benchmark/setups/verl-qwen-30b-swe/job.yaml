@@ -38,6 +38,16 @@ spec:
           else:
               raise SystemExit("ray dashboard never came up")
           PYEOF
+          # Optional gate (`--var PRE_SUBMIT_WAIT_FILE=/data/<file>`): hold the submission until
+          # that file exists on the shared volume. Lets an operator hot-patch the live Ray pods
+          # (e.g. experiments/gpu-host-offload/patch-pods.sh) on a fresh cluster before the
+          # driver imports verl; release with `kubectl exec <head> -- touch <file>`.
+          GATE="${PRE_SUBMIT_WAIT_FILE:-}"
+          if [ -n "$$GATE" ]; then
+            echo "waiting for gate file $$GATE before submitting (touch it on the shared volume to proceed)"
+            while [ ! -e "$$GATE" ]; do sleep 10; done
+            echo "gate open: $$GATE"
+          fi
           exec ray job submit --address "$$RAY_ADDR" \
             --working-dir /etc/rlbench/config \
             -- bash run.sh

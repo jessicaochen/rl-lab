@@ -1,0 +1,68 @@
+# app-offload feature: one external controller pod per GPU node (plain k8s DaemonSet, NOT a Ray
+# node). It finds verl's actors through the Ray dashboard state API and calls them over Ray
+# Client; see config/app_offload_controller.py. No GPU is requested: memory is measured from
+# inside the actor processes. Runs the driver image so Ray/Python versions match the cluster.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: app-offload-controller
+  namespace: rlbench-verl-swe
+spec:
+  selector:
+    matchLabels:
+      app: app-offload-controller
+  template:
+    metadata:
+      labels:
+        app: app-offload-controller
+    spec:
+      serviceAccountName: verl-driver          # pods list in the namespace (15-rbac.yaml): maps Ray node ip -> this k8s node
+      terminationGracePeriodSeconds: 120       # time to reload/wake anything the controller left offloaded
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values: ["${TRAINER_POOL}", "${SAMPLER_POOL}"]
+      tolerations:
+      - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
+      containers:
+      - name: controller
+        image: ${DRIVER_IMAGE}
+        command: ["python3", "-u", "/etc/rlbench/config/app_offload_controller.py"]
+        env:
+        - name: RUN_ID
+          value: "${RUN_ID}"
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        - name: NODE_IP
+          valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+        - name: POD_NAMESPACE
+          valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+        - name: RAY_DASHBOARD_URL
+          value: http://verl-head-svc.rlbench-verl-swe.svc.cluster.local:8265
+        - name: RAY_CLIENT_ADDRESS
+          value: ray://verl-head-svc.rlbench-verl-swe.svc.cluster.local:10001
+        - name: APP_OFFLOAD_OUT
+          value: /data/outputs/${RUN_ID}/app-offload
+        - {name: APP_OFFLOAD_TRAINER_HOLD_S, value: "${APP_OFFLOAD_TRAINER_HOLD_S}"}
+        - {name: APP_OFFLOAD_SAMPLER_HOLD_S, value: "${APP_OFFLOAD_SAMPLER_HOLD_S}"}
+        - {name: APP_OFFLOAD_SAMPLER_CYCLES_PER_STEP, value: "${APP_OFFLOAD_SAMPLER_CYCLES_PER_STEP}"}
+        - {name: APP_OFFLOAD_SAMPLER_AFTER_SYNC_S, value: "${APP_OFFLOAD_SAMPLER_AFTER_SYNC_S}"}
+        - {name: APP_OFFLOAD_POLL_S, value: "${APP_OFFLOAD_POLL_S}"}
+        - {name: APP_OFFLOAD_SETTLE_S, value: "${APP_OFFLOAD_SETTLE_S}"}
+        - {name: APP_OFFLOAD_DRY_RUN, value: "${APP_OFFLOAD_DRY_RUN}"}
+        resources:
+          requests: {cpu: "1", memory: 4Gi}
+          limits: {memory: 8Gi}
+        volumeMounts:
+        - {name: run-config, mountPath: /etc/rlbench/config, readOnly: true}
+        - {name: shared-data, mountPath: /data}
+      volumes:
+      - name: run-config
+        configMap: {name: rlbench-run-config}
+      - name: shared-data
+        persistentVolumeClaim: {claimName: shared-data}

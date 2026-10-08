@@ -70,6 +70,9 @@ done
 # (TaskRunnerV1), which sees runtime-env variables, not this shell's exports.
 # default 0 since the multi-replica rungs: vLLM's per-replica stats lines differ only in numbers and would be collapsed otherwise
 export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-0}
+# `--var MEGATRON_OFFLOAD=False` turns verl's own param/grad/optimizer offload OFF (default True;
+# rendered into the three actor.megatron.*_offload flags below). Megatron's CPU Adam
+# (override_optimizer_config) is untouched by it. Used by experiments/trainer-app-offload.
 if [ "${NO_HYBRID_ROLLOUT:-0}" = "1" ]; then
   EXTRA_OVERRIDES+=('+ray_kwargs.ray_init.runtime_env.env_vars.RLBENCH_NO_HYBRID_ROLLOUT="1"')
 fi
@@ -206,9 +209,9 @@ exec python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
-    actor_rollout_ref.actor.megatron.param_offload=True \
-    actor_rollout_ref.actor.megatron.grad_offload=True \
-    actor_rollout_ref.actor.megatron.optimizer_offload=True \
+    actor_rollout_ref.actor.megatron.param_offload=${MEGATRON_OFFLOAD:-True} \
+    actor_rollout_ref.actor.megatron.grad_offload=${MEGATRON_OFFLOAD:-True} \
+    actor_rollout_ref.actor.megatron.optimizer_offload=${MEGATRON_OFFLOAD:-True} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=$TRAIN_TP \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1 \
     actor_rollout_ref.actor.megatron.context_parallel_size=$TRAIN_CP \

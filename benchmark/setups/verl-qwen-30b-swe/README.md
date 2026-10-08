@@ -19,9 +19,9 @@ no tunnel). Successor to the retired prime-rl setup; same cluster infra.
 | `images/` | `driver.Dockerfile` (verl@v0.9.0 + uni-agent + our packages), `tool.Dockerfile` (mini-swe-agent sidecar, busybox final stage). |
 | `config/common.sh` | The hydra invocation; every topology/batch knob is a shell var. Enforces `TRAIN_BATCH == SYNC_STEP × MINI_BATCH` and `TP·CP·EP ≤ 8` (EP on one node). |
 | `config/h200-t<T>-s<S>/` | One dir per ladder rung (`h200-t8-s1`, `h200-t8-s2`, `h200-t16-s8`, `h200-t16-s4x2`): `run.sh` sets the knobs (default `TOTAL_STEPS=2`) and execs `common.sh` (symlinked, with `task_config.yaml`). `s<R>x<G>` = R vLLM replicas of G GPUs (`ROLLOUT_GPUS=R·G`, `ROLLOUT_TP=G`); plain `s<S>` is one replica of S GPUs. |
-| `features/<name>/` | rlbench opt-in features (`rlbench run ... --feature <name>`), each with its own README. `inference-scheduler`: py-inference-scheduler routes policy requests across the sampler's replicas (needs a `s<R>x<G>` rung and driver image ≥ v7). |
+| `features/<name>/` | rlbench opt-in features (`rlbench run ... --feature <name>`), each with its own README. `inference-scheduler`: py-inference-scheduler routes policy requests across the sampler's replicas (needs a `s<R>x<G>` rung and driver image ≥ v7). `app-offload`: an external controller pod per GPU node (plain k8s DaemonSet, not a Ray node) that finds verl's actors through the Ray state API and tells the trainer ranks on its node to offload / reload GPU memory in the post-sync idle gap over Ray Client (sampler path off by default); see `experiments/trainer-app-offload/`. |
 | `provider/rlbench_verl_provider/rollout_adapter.py` | Always-on `agent_loop_manager_class` (wraps uni-agent's adapter): per-request gateway records + per-replica vLLM `/metrics` snapshots on the shared volume (both arms of any comparison get identical instrumentation); `RLBENCH_ROUTER` selects verl's balancer (default) or the scheduler. |
-| `hooks/` | `pre-setup.sh` deletes leftover rollout sandboxes (previous run's sessions can outlive the Ray job); `post-run.sh` snapshots GKE operations + node inventory into the run folder. |
+| `hooks/` | `pre-setup.sh` deletes leftover rollout sandboxes (previous run's sessions can outlive the Ray job); `post-run.sh` snapshots GKE operations + node inventory into the run folder. and tars the shared-volume artifacts (`agent-logs`, `rollouts`, `val-rollouts`, `gateway-logs`, `replica-metrics`, `app-offload`) into `logs/`. |
 | `tools/compare_runs.py` | Baseline-vs-feature table across run folders (`baseline=runs/<a> inference-scheduler=runs/<b>`): sampling / generation (per-turn latency percentiles, TTFT, queue time, prefix-cache hit rate, replica balance) / training / sync / end-to-end rows + ratios, plus each run's feature evidence. `tools/gen_latency.py` is the generation part for a single run. |
 | `tools/run_report.py` | The metric sheet for one run folder: RL convergence (SWE-bench Verified accuracy start/end, rewards), RL efficiency (GPU duty cycle per role, trainer busy fraction), RL performance (seq lengths, wall clock, step time, tokens/s/GPU, TFLOP/s/GPU), trajectories. `tools/duty_cycle.py`, `tools/trajectories.py` (decode token-level trajectories to text), `tools/ladder_row.py` are its parts. |
 | `docs/scaling-ladder.md` | Per-rung results table (filled as each rung passes). |
@@ -43,6 +43,10 @@ export CKPT_BUCKET=<gcs bucket>                             # HNS bucket, WI-bou
 #   runtime env (trainer ranks, vLLM servers, weight sync) — e.g. NCCL knobs; see the repo-level experiments/.
 # --var RAY_DEDUP_LOGS=0 keeps per-rank worker log lines; --var NO_HYBRID_ROLLOUT=1 (patched verl only)
 #   drops the hybrid vLLM replicas from the trainer GPUs; see experiments/gpu-host-offload/.
+# --var MEGATRON_OFFLOAD=False turns verl's own param/grad/optimizer offload off (Megatron's CPU Adam stays);
+#   the arm-B setting of experiments/trainer-app-offload/.
+# --var PRE_SUBMIT_WAIT_FILE=/data/<file> makes the submitter Job wait for that file on the shared volume
+#   before `ray job submit` (hot-patch the fresh pods first, then `kubectl exec <head> -- touch <file>`).
 rlbench run . --config config/h200-t8-s1 --keep --name h200-t8-s1
 rlbench run . --config config/h200-t8-s2 --keep --name h200-t8-s2
 rlbench run . --config config/h200-t16-s8 --keep --name h200-t16-s8

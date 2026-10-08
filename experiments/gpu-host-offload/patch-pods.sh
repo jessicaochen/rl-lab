@@ -8,13 +8,14 @@
 #   patch-pods.sh apply  [namespace]   # kubectl cp + git apply (refuses if it does not apply cleanly)
 #   patch-pods.sh check  [namespace]   # HEAD sha + git status of /opt/verl in every pod
 #   patch-pods.sh revert [namespace]   # git checkout -- . + remove the added file
+#   PATCH_FILE=<other.patch> PATCH_NEW_FILES="" patch-pods.sh apply   # reuse with another patch
 set -euo pipefail
 ACTION=${1:?usage: patch-pods.sh apply|check|revert [namespace]}
 NS=${2:-rlbench-verl-swe}
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PATCH="$HERE/verl-disagg-memlog.patch"
+PATCH="${PATCH_FILE:-$HERE/verl-disagg-memlog.patch}"   # override: PATCH_FILE=<path> (experiments/trainer-app-offload reuses this script)
 EXPECTED_SHA=adc7eefa16dad75c5f7b878823d5a76eac90c7b3
-NEW_FILES="verl/utils/gpu_mem_log.py"
+NEW_FILES="${PATCH_NEW_FILES-verl/utils/gpu_mem_log.py}"   # files the patch ADDS (removed on revert); PATCH_NEW_FILES="" if none
 
 pods=$(kubectl get pods -n "$NS" -l app=verl-ray -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 [ -n "$pods" ] || { echo "no app=verl-ray pods in namespace $NS" >&2; exit 1; }

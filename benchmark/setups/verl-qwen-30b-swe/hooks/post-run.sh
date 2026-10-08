@@ -72,7 +72,8 @@ PY
 # per-request records and the per-replica vLLM /metrics snapshots (both written
 # by rlbench_verl_provider.rollout_adapter) live on the shared volume too
 if [ -n "$head" ]; then
-  for d in rollouts val-rollouts gateway-logs replica-metrics; do
+  # app-offload: JSONL of the external offload controller (features/app-offload)
+  for d in rollouts val-rollouts gateway-logs replica-metrics app-offload; do
     if kubectl exec -n "$NAMESPACE" "${head#pod/}" -c ray-head -- test -d "/data/outputs/${RUN_ID}/$d" 2>/dev/null; then
       kubectl exec -n "$NAMESPACE" "${head#pod/}" -c ray-head -- tar czf - -C "/data/outputs/${RUN_ID}" "$d" \
         > "${RUN_FOLDER}/logs/$d.tar.gz" 2>/dev/null && echo "post-run: saved $d.tar.gz ($(du -h "${RUN_FOLDER}/logs/$d.tar.gz" | cut -f1))"
