@@ -5,7 +5,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: verl-train
+  name: verl-train-${JOB_ID:-job1}
   namespace: rlbench-verl-swe
 spec:
   backoffLimit: 0
@@ -25,13 +25,13 @@ spec:
         args:
         - |
           set -euo pipefail
-          RAY_ADDR="http://verl-head-svc.rlbench-verl-swe.svc.cluster.local:8265"
+          RAY_ADDR="http://verl-${JOB_ID:-job1}-head-svc.rlbench-verl-swe.svc.cluster.local:8265"
           echo "waiting for Ray dashboard at $$RAY_ADDR"
           python3 - <<'PYEOF'
           import time, urllib.request
           for _ in range(120):
               try:
-                  urllib.request.urlopen("http://verl-head-svc.rlbench-verl-swe.svc.cluster.local:8265/api/version", timeout=5)
+                  urllib.request.urlopen("http://verl-${JOB_ID:-job1}-head-svc.rlbench-verl-swe.svc.cluster.local:8265/api/version", timeout=5)
                   print("ray dashboard up"); break
               except Exception:
                   time.sleep(10)
@@ -61,6 +61,6 @@ spec:
           requests: {cpu: "1", memory: 4Gi}
       volumes:
       - name: run-config
-        configMap: {name: rlbench-run-config}
+        configMap: {name: "rlbench-run-config-${JOB_ID:-job1}"}
       - name: shared-data
         persistentVolumeClaim: {claimName: shared-data}

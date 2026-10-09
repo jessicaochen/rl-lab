@@ -1,13 +1,15 @@
 """rlbench: setup, run, and collect RL training benchmarks on the cluster
 kubectl currently points at.
 
-    rlbench run <setup-folder> [--config f] [--feature NAME]... [--var K=V]... [--keep] [--out runs/] [--timeout 24h]
+    rlbench run <setup-folder> [--config f] [--feature NAME]...
+        [--var K=V]... [--keep] [--out runs/] [--timeout 24h]
     rlbench cleanup <run-folder>
     rlbench collect <run-folder>
 """
 
 from __future__ import annotations
 
+# pylint: disable=line-too-long,missing-function-docstring,too-many-locals,too-many-branches,too-many-statements,broad-exception-caught
 import argparse
 import json
 import os
@@ -117,7 +119,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         pod_targets += f.scrape_targets()
     streamer = kube.LogStreamer(namespace, run.run_id, run.logs)
     sampler = MetricsSampler(namespace, run.metrics, pod_targets=pod_targets)
-    hook_env = {"RUN_ID": run.run_id, "NAMESPACE": namespace, "RLBENCH_FEATURES": variables["RLBENCH_FEATURES"]}
+    hook_env = {
+        "RUN_ID": run.run_id,
+        "NAMESPACE": namespace,
+        "RLBENCH_FEATURES": variables["RLBENCH_FEATURES"],
+        "RUN_FOLDER": str(run.path),
+        "JOB_ID": variables.get("JOB_ID", "job1"),
+    }
     outcome = "SetupFailed"
     job_status: dict = {}
     try:
@@ -133,11 +141,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                 f"--from-file={rendered_config}" if rendered_config.is_dir()
                 else f"--from-file={rendered_config.name}={rendered_config}"
             )
-            manifest = kube.kubectl(
-                "create", "configmap", "rlbench-run-config", "-n", namespace,
-                source, "--dry-run=client", "-o", "yaml",
-            )
-            kube.apply(manifest)
+            for cm_name in dict.fromkeys(("rlbench-run-config", f"rlbench-run-config-{variables.get('JOB_ID', 'job1')}")):
+                manifest = kube.kubectl(
+                    "create", "configmap", cm_name, "-n", namespace,
+                    source, "--dry-run=client", "-o", "yaml",
+                )
+                kube.apply(manifest)
         kube.wait_deployments_ready(namespace, READY_TIMEOUT_S)
         run.mark("setup_ready")
 
@@ -155,7 +164,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         outcome, job_status = result["outcome"], result["job_status"]
         run.mark("job_finished")
         print(f"--> job outcome: {outcome}")
-    except Exception:
+    except Exception:  # noqa: BLE001
         traceback.print_exc()
     finally:
         print("--> collecting")

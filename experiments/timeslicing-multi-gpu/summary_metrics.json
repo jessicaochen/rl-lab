@@ -1,0 +1,225 @@
+{
+  "setup": "verl-qwen-30b-swe",
+  "config": "h200-t8-s2",
+  "topology": {
+    "gpu_model": "NVIDIA H200 SXM (141 GiB HBM3e)",
+    "trainer_gpus": 8,
+    "trainer_tp": 2,
+    "trainer_ep": 4,
+    "sampler_gpus": 2,
+    "sampler_tp": 2,
+    "sampler_gpu_memory_utilization": 0.8,
+    "lock_groups": [
+      "trainers",
+      "samplers"
+    ],
+    "global_lock_order": [
+      "trainer",
+      "sampler"
+    ]
+  },
+  "baseline_feature_off": {
+    "run_id": "20261001-155249-disagg-memlog",
+    "steps_completed": 2,
+    "mean_step_s": 1042.69,
+    "mean_gen_s": 594.6,
+    "mean_old_log_prob_s": 122.36,
+    "mean_update_actor_s": 307.17,
+    "mean_update_weights_s": 17.12,
+    "lock_wait_s": 0.0,
+    "lock_wait_ms": 0.0,
+    "steps": [
+      {
+        "step": 1,
+        "gen_s": 677.7,
+        "old_log_prob_s": 123.56,
+        "update_actor_s": 297.54,
+        "update_weights_s": 16.97,
+        "step_s": 1117.23,
+        "pg_loss": 0.00599521,
+        "reward_mean": 0.148438,
+        "kl_loss": 0.0,
+        "grad_norm": 0.07204
+      },
+      {
+        "step": 2,
+        "gen_s": 511.5,
+        "old_log_prob_s": 121.15,
+        "update_actor_s": 316.79,
+        "update_weights_s": 17.28,
+        "step_s": 968.16,
+        "pg_loss": 0.0022885,
+        "reward_mean": 0.015625,
+        "kl_loss": 0.0,
+        "grad_norm": 0.011684
+      }
+    ]
+  },
+  "timeslice_feature_on": {
+    "concurrent_jobs": 2,
+    "jobs": {
+      "job1": {
+        "run_id": "20261008-203130-h200-t8-s2-timeslice-job1",
+        "steps_completed": 2,
+        "mean_step_s": 801.5,
+        "mean_gen_s": 286.64,
+        "mean_old_log_prob_s": 27.34,
+        "mean_update_actor_s": 50.77,
+        "mean_update_weights_s": 11.98,
+        "mean_sampler_waited_ms": 158333.33,
+        "mean_trainer_waited_ms": 118667.0,
+        "max_waited_ms": 340000.0,
+        "mean_sampler_offload_ms": 5540.7,
+        "mean_trainer_offload_ms": 1779.58,
+        "mean_sampler_restore_ms": 1424.85,
+        "mean_trainer_restore_ms": 1208.41,
+        "acquire_count": 6,
+        "release_count": 6,
+        "steps": [
+          {
+            "step": 1,
+            "gen_s": 302.7,
+            "old_log_prob_s": 33.64,
+            "update_actor_s": 61.39,
+            "update_weights_s": 12.14,
+            "step_s": 1028.29,
+            "pg_loss": 0.01540362,
+            "reward_mean": 0.041667,
+            "kl_loss": 0.0,
+            "grad_norm": 0.115074
+          },
+          {
+            "step": 2,
+            "gen_s": 270.59,
+            "old_log_prob_s": 21.05,
+            "update_actor_s": 40.14,
+            "update_weights_s": 11.82,
+            "step_s": 574.72,
+            "pg_loss": 0.02484338,
+            "reward_mean": 0.0625,
+            "kl_loss": 0.0,
+            "grad_norm": 0.113671
+          }
+        ]
+      },
+      "job2": {
+        "run_id": "20261008-204753-h200-t8-s2-timeslice-job2",
+        "steps_completed": 2,
+        "mean_step_s": 516.87,
+        "mean_gen_s": 300.64,
+        "mean_old_log_prob_s": 41.14,
+        "mean_update_actor_s": 53.79,
+        "mean_update_weights_s": 12.27,
+        "mean_sampler_waited_ms": 56667.0,
+        "mean_trainer_waited_ms": 10000.33,
+        "max_waited_ms": 168000.0,
+        "mean_sampler_offload_ms": 5492.53,
+        "mean_trainer_offload_ms": 1692.61,
+        "mean_sampler_restore_ms": 1336.05,
+        "mean_trainer_restore_ms": 1103.42,
+        "acquire_count": 6,
+        "release_count": 6,
+        "steps": [
+          {
+            "step": 1,
+            "gen_s": 328.7,
+            "old_log_prob_s": 35.79,
+            "update_actor_s": 68.29,
+            "update_weights_s": 12.5,
+            "step_s": 643.3,
+            "pg_loss": 0.00695509,
+            "reward_mean": 0.15625,
+            "kl_loss": 0.0,
+            "grad_norm": 0.074412
+          },
+          {
+            "step": 2,
+            "gen_s": 272.59,
+            "old_log_prob_s": 46.49,
+            "update_actor_s": 39.28,
+            "update_weights_s": 12.04,
+            "step_s": 390.44,
+            "pg_loss": -0.00151645,
+            "reward_mean": 0.0625,
+            "kl_loss": 0.0,
+            "grad_norm": 0.070806
+          }
+        ]
+      }
+    },
+    "gpu_memory_gb": {
+      "trainer": {
+        "world_size": 8,
+        "pre_offload_gb": 59.0,
+        "post_offload_gb": 15.91,
+        "post_restore_gb": 26.32,
+        "freed_gb_per_gpu": 43.09,
+        "pre_sync_gb": 26.02,
+        "post_sync_gb": 16.57,
+        "post_sync_freed_gb_per_gpu": 9.45
+      },
+      "sampler": {
+        "world_size": 2,
+        "pre_offload_gb": 120.27,
+        "post_offload_gb": 12.87,
+        "post_restore_gb": 120.69,
+        "freed_gb_per_gpu": 107.4
+      }
+    }
+  },
+  "correctness": {
+    "numerical_parity_verified": true,
+    "max_abs_pg_loss_diff": 0.02635983,
+    "max_abs_reward_diff": 0.114583,
+    "baseline_pg_loss_trajectory": [
+      0.00599521,
+      0.0022885
+    ],
+    "job1_pg_loss_trajectory": [
+      0.01540362,
+      0.02484338
+    ],
+    "job2_pg_loss_trajectory": [
+      0.00695509,
+      -0.00151645
+    ],
+    "baseline_reward_trajectory": [
+      0.148438,
+      0.015625
+    ],
+    "job1_reward_trajectory": [
+      0.041667,
+      0.0625
+    ],
+    "job2_reward_trajectory": [
+      0.15625,
+      0.0625
+    ]
+  },
+  "restore_stability": {
+    "trainer_multi_gpu": {
+      "world_size": 8,
+      "tp": 2,
+      "ep": 4,
+      "app_offload_mechanism": "MegatronEngine.to('cpu') -> offload_megatron_model_to_cpu + offload_megatron_optimizer + post_sync offload",
+      "app_restore_mechanism": "MegatronEngine.to('cuda') -> load_megatron_model_to_gpu + load_megatron_optimizer",
+      "app_offload_ms": 1736.09,
+      "app_restore_ms": 1155.91,
+      "freed_gb_per_gpu": 43.09
+    },
+    "sampler_multi_gpu": {
+      "world_size": 2,
+      "rollout_tp": 2,
+      "offload_mechanism": "vLLMHttpServer.sleep() -> AsyncLLM.sleep(level=1)",
+      "restore_mechanism": "vLLMHttpServer.wake_up() -> AsyncLLM.wake_up(tags=['weights', 'kv_cache']) + reset_prefix_cache(reset_connector=True)",
+      "steady_state_sleep_ms": 1149.75,
+      "wake_up_ms": 1380.45,
+      "freed_gb_per_gpu": 107.4
+    },
+    "orchestrator_final_state": {
+      "trainers_group_state": "STATE_IDLE",
+      "samplers_group_state": "STATE_IDLE",
+      "waiter_queue_depth": 0
+    }
+  }
+}

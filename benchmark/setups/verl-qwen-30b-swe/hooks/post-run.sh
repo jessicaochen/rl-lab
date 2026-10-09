@@ -24,7 +24,10 @@ kubectl get nodes -o custom-columns='NODE:.metadata.name,CREATED:.metadata.creat
 # per-episode uni-agent session logs live only on the shared volume
 # (/data/outputs/<RUN_ID>/agent-logs); pull them into the run folder so they
 # survive teardown of the PVC and analysis stays rooted in the run folder
-head="$(kubectl get pods -n "${NAMESPACE:?}" -l ray.io/node-type=head -o name 2>/dev/null | head -1)"
+head="$(kubectl get pods -n "${NAMESPACE:?}" -l "ray.io/node-type=head,rlbench.timeslice.io/job-id=${JOB_ID:-job1}" -o name 2>/dev/null | head -1)"
+if [ -z "$head" ]; then
+  head="$(kubectl get pods -n "${NAMESPACE:?}" -l ray.io/node-type=head -o name 2>/dev/null | head -1)"
+fi
 if [ -n "$head" ] && kubectl exec -n "$NAMESPACE" "${head#pod/}" -c ray-head -- test -d "/data/outputs/${RUN_ID:?}/agent-logs" 2>/dev/null; then
   mkdir -p "${RUN_FOLDER}/logs"
   kubectl exec -n "$NAMESPACE" "${head#pod/}" -c ray-head -- tar czf - -C "/data/outputs/${RUN_ID}" agent-logs \

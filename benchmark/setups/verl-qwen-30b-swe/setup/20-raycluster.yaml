@@ -11,7 +11,7 @@
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
-  name: verl
+  name: verl-${JOB_ID:-job1}
   namespace: rlbench-verl-swe
 spec:
   rayVersion: "2.49.0"
@@ -23,6 +23,8 @@ spec:
       metadata:
         labels:
           app: verl-ray
+          rlbench.timeslice.io/job-id: ${JOB_ID:-job1}
+          rlbench.timeslice.io/role: head
       spec:
         serviceAccountName: verl-driver
         nodeSelector:
@@ -41,7 +43,7 @@ spec:
           - name: HF_HOME
             value: /data/hf-cache
           resources:
-            requests: {cpu: "10", memory: 40Gi}
+            requests: {cpu: "${HEAD_CPU_REQ:-10}", memory: ${HEAD_MEM_REQ:-40Gi}}
           volumeMounts:
           - {name: shared-data, mountPath: /data}
         volumes:
@@ -49,15 +51,17 @@ spec:
           persistentVolumeClaim: {claimName: shared-data}
   workerGroupSpecs:
   - groupName: trainer
-    replicas: 2
-    minReplicas: 2
-    maxReplicas: 2
+    replicas: ${TRAINER_REPLICAS:-2}
+    minReplicas: ${TRAINER_REPLICAS:-2}
+    maxReplicas: ${TRAINER_REPLICAS:-2}
     rayStartParams:
-      num-gpus: "8"
+      num-gpus: "${TRAINER_RAY_GPUS:-8}"
     template:
       metadata:
         labels:
           app: verl-ray
+          rlbench.timeslice.io/job-id: ${JOB_ID:-job1}
+          rlbench.timeslice.io/role: trainer
         annotations:
           gke-gcsfuse/volumes: "true"        # checkpoint bucket (full runs)
           gke-gcsfuse/cpu-limit: "8"
@@ -70,6 +74,7 @@ spec:
         tolerations:
         - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
         - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
+        resourceClaims: ${TRAINER_POD_CLAIMS:-[]}
         initContainers:
         - name: fix-perms
           image: busybox:1.36
@@ -93,11 +98,12 @@ spec:
             value: eth0
           resources:
             requests:
-              nvidia.com/gpu: 8
-              cpu: "64"
-              memory: 1024Gi
+              ${TRAINER_GPU_REQ:-nvidia.com/gpu: 8}
+              cpu: "${WORKER_CPU_REQ:-64}"
+              memory: ${WORKER_MEM_REQ:-1024Gi}
             limits:
-              nvidia.com/gpu: 8
+              ${TRAINER_GPU_LIM:-nvidia.com/gpu: 8}
+            claims: ${TRAINER_CONTAINER_CLAIMS:-[]}
           volumeMounts:
           - {name: shared-data, mountPath: /data}
           - {name: ckpt-gcs, mountPath: /ckpt-gcs}
@@ -118,11 +124,13 @@ spec:
     minReplicas: 1
     maxReplicas: 1
     rayStartParams:
-      num-gpus: "8"
+      num-gpus: "${ROLLOUT_RAY_GPUS:-8}"
     template:
       metadata:
         labels:
           app: verl-ray
+          rlbench.timeslice.io/job-id: ${JOB_ID:-job1}
+          rlbench.timeslice.io/role: sampler
         annotations:
           gke-gcsfuse/volumes: "true"
           gke-gcsfuse/cpu-limit: "8"
@@ -135,6 +143,7 @@ spec:
         tolerations:
         - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
         - {key: timeslice.io/shared, operator: Exists, effect: NoSchedule}
+        resourceClaims: ${SAMPLER_POD_CLAIMS:-[]}
         initContainers:
         - name: fix-perms
           image: busybox:1.36
@@ -156,11 +165,12 @@ spec:
             value: eth0
           resources:
             requests:
-              nvidia.com/gpu: 8
-              cpu: "64"
-              memory: 1024Gi
+              ${SAMPLER_GPU_REQ:-nvidia.com/gpu: 8}
+              cpu: "${WORKER_CPU_REQ:-64}"
+              memory: ${WORKER_MEM_REQ:-1024Gi}
             limits:
-              nvidia.com/gpu: 8
+              ${SAMPLER_GPU_LIM:-nvidia.com/gpu: 8}
+            claims: ${SAMPLER_CONTAINER_CLAIMS:-[]}
           volumeMounts:
           - {name: shared-data, mountPath: /data}
           - {name: ckpt-gcs, mountPath: /ckpt-gcs}

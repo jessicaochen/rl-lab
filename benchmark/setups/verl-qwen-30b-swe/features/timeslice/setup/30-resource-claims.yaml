@@ -1,0 +1,33 @@
+# Shared DRA ResourceClaims for multi-job GPU time-slicing on trainer and sampler pools.
+# Applied after base setup manifests when `--feature timeslice` is enabled.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: shared-trainers-gpu-claim
+  namespace: ${NAMESPACE:-rlbench-verl-swe}
+  labels:
+    rlbench.timeslice.io/group: ${TIMESLICE_TRAINER_GROUP:-trainers}
+spec:
+  devices:
+    requests:
+    - name: gpu
+      exactly:
+        deviceClassName: gpu.nvidia.com
+        allocationMode: ExactCount
+        count: ${TRAINER_CLAIM_GPUS:-8}
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: shared-samplers-gpu-claim
+  namespace: ${NAMESPACE:-rlbench-verl-swe}
+  labels:
+    rlbench.timeslice.io/group: ${TIMESLICE_SAMPLER_GROUP:-samplers}
+spec:
+  devices:
+    requests:
+    - name: gpu
+      exactly:
+        deviceClassName: gpu.nvidia.com
+        allocationMode: ExactCount
+        count: ${SAMPLER_CLAIM_GPUS:-8}
