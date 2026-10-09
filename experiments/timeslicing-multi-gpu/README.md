@@ -140,7 +140,55 @@ Execution proceeds through three pipelined phases per step in `PPOTrainerSeparat
 | **Trainer Cooperative Offload (`MegatronEngine.to` + `post_sync`)** | `world_size=8` (`TP=2, EP=4`) | `param_offload=True, grad_offload=True, optimizer_offload=True` + explicit `post_sync:to_cpu` + `RLBENCH_NO_HYBRID_ROLLOUT=1` | `1736.09 ms` (`795 ms` `post_sync`) | `1155.91 ms` | `43.09 GiB` (`9.45 GiB` `post_sync`) | `15.91 GiB` (2 jobs co-resident) | **Stable**: 100% success across all 8 ranks and all steps on `job1` & `job2` |
 | **Sampler Cooperative Sleep (`vLLMHttpServer.sleep(level=1)`)** | `world_size=2` (`ROLLOUT_TP=2`) | Skip warmup pre-queuing + `abort_replicas()` request drain + `sleep(level=1)` + `wake_up(tags=["weights","kv_cache"])` + `reset_prefix_cache` | `1149.75 ms` warm (`14250.4 ms` cold 1st sleep) | `1380.45 ms` | `107.40 GiB` | `12.87 GiB` (2 jobs co-resident) | **Stable**: 100% success across both TP ranks with in-place NCCL weight sync |
 
-### 6.1 Verbatim Sanitized Telemetry Excerpts (`20261008-203130-h200-t8-s2-timeslice-job1` & `20261008-204753-h200-t8-s2-timeslice-job2`)
+### 6.1 Code Changes Required for Multi-GPU Checkpoint & Offload/Restore Stability
+
+#### A. Trainer-Specific Changes (`8x H200`, Megatron `TP=2, EP=4`)
+
+1. **Explicit Post-Weight-Sync Parameter Offload (`post_sync:to_cpu`)**:
+   - **Root Cause**: During `update_weights`, `get_per_tensor_param()` reloads `8.80 GB` (`9.45 GiB/GPU`) of bf16 model parameters onto the trainer GPUs for the NCCL broadcast to the sampler, and stock `verl` leaves them resident on GPU afterward.
+   - **Code**:
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/verl-timeslice.patch` (`verl/workers/engine_workers.py` -> `ActorRolloutRefWorker.update_weights()`): Immediately after `await self.checkpoint_engine.send_weights(...)`, calls `self.actor.engine.to("cpu", model=True, optimizer=False, grad=False, point="post_sync")` + `aggressive_empty_cache(force_sync=True)` (gated by `VERL_TRAINER_POST_SYNC_OFFLOAD=1`).
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/verl-timeslice.patch` (`verl/workers/engine/megatron/transformer_impl.py` -> `MegatronEngine.to()`): Adds `point` tagging (`init`, `eval_end`, `train_end`, `post_sync`), `torch.cuda.synchronize()`, and `[gpu-mem]` / `[timeslice]` telemetry around every CPU<->GPU transition; helper wrapper in `benchmark/setups/verl-qwen-30b-swe/features/timeslice/timeslice.py` (`offload_megatron_trainer()`, `restore_megatron_trainer()`).
+2. **Disabling Hybrid vLLM Replicas on Trainer GPUs (`RLBENCH_NO_HYBRID_ROLLOUT=1`)**:
+   - **Root Cause**: By default, `verl` spawns hybrid vLLM rollout replicas on the trainer GPUs that keep ~7–8 GiB/GPU of un-offloadable CUDA graph executables and TP NCCL communicators resident even while sleeping.
+   - **Code**:
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/verl-timeslice.patch` (`verl/trainer/ppo/v1/trainer_base.py` -> `PPOTrainer` and `verl/trainer/ppo/v1/trainer_separate_async.py` -> `PPOTrainerSeparateAsync`): When `RLBENCH_NO_HYBRID_ROLLOUT=1` (exported in `benchmark/setups/verl-qwen-30b-swe/features/timeslice/config/feature-timeslice.sh`), assigns worker role `"actor"` instead of `"actor_rollout"` and skips creating `self.llm_server_manager` and `self.checkpoint_manager` on the trainer pool.
+3. **Releasing the Trainer Lock During Rollout Generation (`trainers` Group)**:
+   - **Root Cause**: The trainer GPUs are idle after `update_weights` finishes while waiting for the sampler to generate the next rollout batch.
+   - **Code**:
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/verl-timeslice.patch` (`verl/trainer/ppo/v1/trainer_separate_async.py` -> `PPOTrainerSeparateAsync._setup()`, `on_init_end()`, `step()`, `on_step_end()`): Acquires `"trainer"` in `_setup()`, releases `"trainer"` at the end of `on_init_end()` and `on_step_end()` right after `post_sync:to_cpu`, and re-acquires `"trainer"` in `step()` only after `replay_buffer.sample()` completes (gated by `TIMESLICE_TRAINER_ENABLED=1`).
+
+#### B. Sampler-Specific Changes (`2x H200`, Standalone vLLM `ROLLOUT_TP=2`)
+
+1. **Enabling Level-1 Sleep & Wake in Standalone vLLM Mode (`VERL_SAMPLER_SLEEP_OFFLOAD=1`)**:
+   - **Root Cause**: Stock `verl`'s `vLLMHttpServer.sleep()` and `wake_up()` are no-ops when `rollout_mode == RolloutMode.STANDALONE` (`logger.info("skip sleep in standalone mode")`). Furthermore, `sleep(level=2)` discards weight tensor allocations that `verl`'s NCCL weight sync writes into in-place.
+   - **Code**:
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/verl-timeslice.patch` (`verl/workers/rollout/vllm_rollout/vllm_async_server.py` -> `vLLMHttpServer.sleep()`, `wake_up()`, `release_kv_cache()`): Implements standalone `await self.engine.sleep(level=1)` (moving weights to pinned host DRAM while preserving buffer pointers and freeing KV cache HBM pages) and `await self.engine.wake_up(tags=["weights", "kv_cache"])` + `await self.engine.reset_prefix_cache(reset_connector=True)` inside the actor's async event loop; standalone helpers in `benchmark/setups/verl-qwen-30b-swe/features/timeslice/timeslice.py` (`sleep_vllm_sampler_async()`, `wake_vllm_sampler_async()`).
+2. **Skipping Async Warmup Pre-Queuing & Draining In-Flight Requests Before Sleep**:
+   - **Root Cause**: Stock `PPOTrainerSeparateAsync.on_train_begin()` pre-queues `num_warmup_batches` so rollout requests remain continuously in flight while the trainer trains. Putting a multi-GPU (`ROLLOUT_TP=2`) vLLM engine to sleep while requests are in flight corrupts paged KV cache block tables and deadlocks TP NCCL collectives.
+   - **Code**:
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/verl-timeslice.patch` (`verl/trainer/ppo/v1/trainer_separate_async.py` -> `PPOTrainerSeparateAsync.on_train_begin()`, `step()`, `on_step_end()`): Skips warmup batch pre-queuing in `on_train_begin()`, calls `self.standalone_checkpoint_manager.abort_replicas()` followed by `sleep_replicas()` and `self.role_locks.release("sampler")` at the end of Phase 1 (`step()`), and calls `self.role_locks.acquire("sampler")` + `wake_up_replicas()` at the start of Phase 3 (`on_step_end()`) before `update_weights()`, retaining `"sampler"` into the next step's Phase 1 (gated by `TIMESLICE_SAMPLER_ENABLED=1` and `VERL_SAMPLER_SLEEP_OFFLOAD=1`).
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/timeslice.py` (`drain_sampler_inflight_requests()`): Polls `get_num_unfinished_requests()` to zero prior to `sleep(level=1)` and enforces `ROLLOUT_GPU_MEM_UTIL <= 0.85` (`0.80` in `vars.env`).
+
+#### C. Shared Changes (Both Trainer & Sampler: `cuda-checkpoint`, NCCL, Orchestrator & Co-Scheduling)
+
+1. **Disabling NCCL NVLS Multicast (`NCCL_NVLS_ENABLE=0`), Watchdog Timeouts & `cuda-checkpoint` Signal Shim (`SIG35`/`SIG36`)**:
+   - **Root Cause**: On multi-GPU H200 SXM nodes, `cuda-checkpoint --action lock` fails with `CUDA_ERROR_NOT_SUPPORTED` (`error 801` / `exit status 1`) if NCCL allocates NVLink SHARP (`NVLS`) multicast memory handles (`cuMemCreate`), and PyTorch's NCCL watchdog aborts ranks during multi-minute lock waits or process freeze windows.
+   - **Code**:
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/config/feature-timeslice.sh`: Exports and injects `NCCL_NVLS_ENABLE=0`, `TORCH_NCCL_ENABLE_MONITORING=0`, `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=21600`, `NCCL_WATCHDOG_TIMEOUT_SEC=21600`, `TORCH_DISTRIBUTED_TIMEOUT=21600`, and optional `LD_PRELOAD` / `VLLM_NCCL_SO_PATH` (`TIMESLICE_SHIM_PATH`) into Ray `runtime_env.env_vars`.
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/timeslice.py` (`SIG_PRE_CHECKPOINT = 35`, `SIG_POST_RESTORE = 36`, `trigger_cuda_checkpoint_transition()`, `aggressive_empty_cache()`): Validates `NCCL_NVLS_ENABLE=0`, flushes PyTorch CUDA IPC caches (`torch.cuda.ipc_collect()`), signals `universal_cr_shim_v2.c` (`SIGRTMIN+1`=35) to destroy NCCL communicators before `cuda-checkpoint --action lock` / `checkpoint`, and signals `SIGRTMIN+2`=36 after `cuda-checkpoint --toggle` to lazily rebuild communicators.
+2. **Deadlock-Free Global Lock Order (`TRAINER -> SAMPLER`) & gRPC Keepalive Resilience**:
+   - **Root Cause**: Two jobs acquiring `"trainers"` and `"samplers"` in opposite orders deadlock at `init` or `update_weights`. Additionally, default client gRPC keepalive pings (`30s` with `keepalive_permit_without_calls=1`) during multi-minute lock waits caused the Go orchestrator server (`MinTime = 5m`) to drop connections with `GOAWAY: too_many_pings` (`ENHANCE_YOUR_CALM`).
+   - **Code**:
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/timeslice.py` (`DualPoolRoleLocks`): Enforces `TRAINER` before `SAMPLER` lock acquisition order (`acquire()` raises `RuntimeError("lock-order violation: ...")` if `"trainer"` is requested while holding `"sampler"`).
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/timeslice.py` (`_DirectGrpcOrchestratorStub`, `TimeSliceOrchestratorClient`): Configures `("grpc.keepalive_time_ms", 600000)` and `("grpc.keepalive_permit_without_calls", 0)` with automatic channel reconnect and retry in `acquire()` / `release()`.
+3. **Multi-Job Kubernetes DRA Co-Scheduling & RayCluster Node Patching**:
+   - **Root Cause**: Static `nvidia.com/gpu: 8` pod requests prevent concurrent jobs from co-scheduling onto the same physical H200 nodes, and KubeRay workers starting asynchronously must have `/opt/verl` patched before `verl` spawns Ray actors.
+   - **Code**:
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/setup/30-resource-claims.yaml`, `benchmark/setups/verl-qwen-30b-swe/features/timeslice/vars.env`, `benchmark/setups/verl-qwen-30b-swe/setup/20-raycluster.yaml`, `benchmark/setups/verl-qwen-30b-swe/job.yaml`, and `benchmark/rlbench/src/rlbench/cli.py`: Binds trainer and sampler pods to shared DRA `ResourceClaim`s (`shared-trainers-gpu-claim`, `shared-samplers-gpu-claim`) and namespaces `RayCluster`, submitter `Job`, and `ConfigMap` names by `${JOB_ID:-job1}`.
+     - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/config/feature-timeslice.sh` (`_patch_node`): Waits for all expected Ray nodes/GPUs to join the RayCluster and applies `timeslice.py` + `verl-timeslice.patch` on every node via `NodeAffinitySchedulingStrategy` before launching the trainer.
+
+### 6.2 Verbatim Sanitized Telemetry Excerpts (`20261008-203130-h200-t8-s2-timeslice-job1` & `20261008-204753-h200-t8-s2-timeslice-job2`)
 
 ```text
 # Dual-Pool Lock Interleaving ([timeslice] logs from job1 and job2):
