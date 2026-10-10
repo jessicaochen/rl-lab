@@ -1,13 +1,13 @@
-# Multi-GPU Dual-Pool Time-Slicing Benchmark & Restore Stability Report (`h200-t8-s2`)
+# Multi-GPU Time-Slicing Benchmark & Restore Stability Report (`h200-t8-s2` & `h200-t8-s1`)
 
 ## 1. Executive Summary & Provenance
 
 This report documents the empirical performance, GPU VRAM reclamation, numerical convergence parity, and multi-GPU checkpoint/offload and restore stability of the `llm-d-rl-time-slicing` orchestrator integrated into `rl-lab` (`benchmark/setups/verl-qwen-30b-swe/features/timeslice/`).
 
 All benchmark runs were executed via `rlbench run` using the `verl-qwen-30b-swe` setup (`config/h200-t8-s2`: 8x H200 Megatron trainer `TP=2, EP=4` + 2x H200 standalone vLLM sampler `ROLLOUT_TP=2`) on NVIDIA H200 SXM (141 GiB HBM3e):
-- **Feature OFF (Baseline):** `20261001-155249-disagg-memlog`
-- **Feature ON (Concurrent Job 1):** `20261008-203130-h200-t8-s2-timeslice-job1`
-- **Feature ON (Concurrent Job 2):** `20261008-204753-h200-t8-s2-timeslice-job2`
+- **Feature OFF (Baseline):** `baseline` (`h200-t8-s2` Feature OFF)
+- **Feature ON (Concurrent Job 1):** `job1` (`h200-t8-s2` Feature ON)
+- **Feature ON (Concurrent Job 2):** `job2` (`h200-t8-s2` Feature ON)
 
 All summary metrics in `summary_metrics.json` and the tables below are generated from the `verl` run logs by `experiments/timeslicing-multi-gpu/report.py`.
 
@@ -27,9 +27,9 @@ All summary metrics in `summary_metrics.json` and the tables below are generated
 
 | Run | `--feature` | `JOB_ID` | Regime & Description |
 | --- | --- | --- | --- |
-| `20261001-155249-disagg-memlog` | — | `baseline` | Feature OFF baseline: single multi-GPU `verl` RL job (`8` Trainer H200 GPUs `TP=2, EP=4` + `2` Sampler H200 GPUs `ROLLOUT_TP=2`) without time-slicing lock orchestration |
-| `20261008-203130-h200-t8-s2-timeslice-job1` | `timeslice` | `job1` | Feature ON concurrent `verl` Job 1 sharing the `8`-GPU `trainers` pool and `2`-GPU `samplers` pool via `llm-d-rl-time-slicing` (`outcome: Complete`) |
-| `20261008-204753-h200-t8-s2-timeslice-job2` | `timeslice` | `job2` | Feature ON concurrent `verl` Job 2 sharing the `8`-GPU `trainers` pool and `2`-GPU `samplers` pool via `llm-d-rl-time-slicing` (`outcome: Complete`) |
+| `baseline` (`h200-t8-s2` Feature OFF) | — | `baseline` | Feature OFF baseline: single multi-GPU `verl` RL job (`8` Trainer H200 GPUs `TP=2, EP=4` + `2` Sampler H200 GPUs `ROLLOUT_TP=2`) without time-slicing lock orchestration |
+| `job1` (`h200-t8-s2` Feature ON) | `timeslice` | `job1` | Feature ON concurrent `verl` Job 1 sharing the `8`-GPU `trainers` pool and `2`-GPU `samplers` pool via `llm-d-rl-time-slicing` (`outcome: Complete`) |
+| `job2` (`h200-t8-s2` Feature ON) | `timeslice` | `job2` | Feature ON concurrent `verl` Job 2 sharing the `8`-GPU `trainers` pool and `2`-GPU `samplers` pool via `llm-d-rl-time-slicing` (`outcome: Complete`) |
 
 ### 1.3 GPU Lock Acquire/Release & Offload/Restore Execution Flow (`--feature timeslice`)
 
@@ -65,13 +65,13 @@ Execution proceeds through three pipelined phases per step in `PPOTrainerSeparat
 
 ### 2.1 Per-Step Granular Breakdown
 
-- **Feature OFF (`baseline` — run `20261001-155249-disagg-memlog`)**:
+- **Feature OFF (`baseline` — run `baseline` (`h200-t8-s2` Feature OFF))**:
   - Step 1: `gen_s=677.70s`, `old_log_prob_s=123.56s`, `update_actor_s=297.54s`, `update_weights_s=16.97s`, `step_s=1117.23s`
   - Step 2: `gen_s=511.50s`, `old_log_prob_s=121.15s`, `update_actor_s=316.79s`, `update_weights_s=17.28s`, `step_s=968.16s`
-- **Feature ON (`job1` — run `20261008-203130-h200-t8-s2-timeslice-job1`, `TS_TRAIN_BATCH=64, TS_ROLLOUT_N=4, TS_SESSIONS=64`)**:
+- **Feature ON (`job1` — run `job1` (`h200-t8-s2` Feature ON), `TS_TRAIN_BATCH=64, TS_ROLLOUT_N=4, TS_SESSIONS=64`)**:
   - Step 1: `gen_s=302.70s`, `old_log_prob_s=33.64s`, `update_actor_s=61.39s`, `update_weights_s=12.14s`, `step_s=1028.29s`
   - Step 2: `gen_s=270.59s`, `old_log_prob_s=21.05s`, `update_actor_s=40.14s`, `update_weights_s=11.82s`, `step_s=574.72s`
-- **Feature ON (`job2` — run `20261008-204753-h200-t8-s2-timeslice-job2`, `TS_TRAIN_BATCH=64, TS_ROLLOUT_N=4, TS_SESSIONS=64`)**:
+- **Feature ON (`job2` — run `job2` (`h200-t8-s2` Feature ON), `TS_TRAIN_BATCH=64, TS_ROLLOUT_N=4, TS_SESSIONS=64`)**:
   - Step 1: `gen_s=328.70s`, `old_log_prob_s=35.79s`, `update_actor_s=68.29s`, `update_weights_s=12.50s`, `step_s=643.30s`
   - Step 2: `gen_s=272.59s`, `old_log_prob_s=46.49s`, `update_actor_s=39.28s`, `update_weights_s=12.04s`, `step_s=390.44s`
 
@@ -169,7 +169,7 @@ The changes below are required **strictly** because the trainer (`world_size=8`,
    - **Code**:
      - `benchmark/setups/verl-qwen-30b-swe/features/timeslice/config/feature-timeslice.sh`: Injects `NCCL_NVLS_ENABLE="0"` and `VLLM_NCCL_SO_PATH="${TIMESLICE_SHIM_PATH:-}"` into `ray_kwargs.ray_init.runtime_env.env_vars`.
 
-### 6.2 Verbatim Sanitized Telemetry Excerpts (`20261008-203130-h200-t8-s2-timeslice-job1` & `20261008-204753-h200-t8-s2-timeslice-job2`)
+### 6.2 Verbatim Sanitized Telemetry Excerpts (`job1` (`h200-t8-s2` Feature ON) & `job2` (`h200-t8-s2` Feature ON))
 
 ```text
 # Dual-Pool Lock Interleaving ([timeslice] logs from job1 and job2):
@@ -204,6 +204,40 @@ The changes below are required **strictly** because the trainer (`world_size=8`,
 [gpu-mem] job_id=job1 role=trainer rank=0 host=verl-job1-trainer-worker-0 pid=2653 point=init:to_cpu event=after gpu_allocated_gb=1.067 gpu_reserved_gb=2.990 gpu_device_used_gb=17.916 gpu_device_total_gb=139.809 seconds=1.969 model=1 optimizer=1 grad=1 bytes_copied_to_host=8804426240 bytes_discarded=8804426240 gpu_resident_params=0 gpu_resident_grads=0
 [gpu-mem] job_id=job1 role=trainer rank=0 host=verl-job1-trainer-worker-0 pid=2653 point=post_sync:to_cpu event=after gpu_allocated_gb=1.067 gpu_reserved_gb=1.850 gpu_device_used_gb=16.571 gpu_device_total_gb=139.809 seconds=0.717 model=1 optimizer=0 grad=0 bytes_copied_to_host=8804426240 gpu_resident_params=0 gpu_resident_grads=0
 ```
+
+---
+
+---
+
+## 8. Simplified Trainer-Only Application-Channel Offload Experiment (`h200-t8-s1`, `verl-app-channel-offload`)
+
+### 8.1 Hardware & Topology Configuration (`h200-t8-s1`) & Architectural Comparison (`signals` vs. `app_channel`)
+
+In the `h200-t8-s1` topology, two concurrent `verl-qwen-30b-swe` jobs share the 8-GPU trainer node (`trainers` lock group, `world_size=8`, Megatron `TP=2, EP=4`) via `llm-d-rl-time-slicing` (`verl-app-channel-offload` branch), while each job's 1-GPU standalone vLLM sampler (`ROLLOUT_TP=1`, `nvidia.com/gpu: 1`) runs dedicated and unshared (`TIMESLICE_SAMPLER_ENABLED=0`, `VERL_SAMPLER_SLEEP_OFFLOAD=0`) on the 8-GPU sampler node:
+
+| Parameter | `h200-t8-s2` (Dual-Pool Signal + C/R Mode) | `h200-t8-s1` (`verl-app-channel-offload` Trainer-Only Mode) |
+| --- | --- | --- |
+| **Trainer Topology** | `8` H200 GPUs shared (`TP=2, EP=4`, `shared-trainers-gpu-claim`) | `8` H200 GPUs shared (`TP=2, EP=4`, `shared-trainers-gpu-claim`) |
+| **Sampler Topology** | `2` H200 GPUs shared (`ROLLOUT_TP=2`, `shared-samplers-gpu-claim`) | `1` H200 GPU per job unshared (`ROLLOUT_TP=1`, standard `nvidia.com/gpu: 1`) |
+| **Orchestrator Lock Groups** | `trainers` + `samplers` (`TIMESLICE_SAMPLER_ENABLED=1`) | `trainers` only (`TIMESLICE_TRAINER_ENABLED=1`, `TIMESLICE_SAMPLER_ENABLED=0`) |
+| **Offload Control Plane** | `cuda-checkpoint` + `SIG35`/`SIG36` + `libuniversal_cr_shim.so` | gRPC `SnapshotAgentService.WorkloadChannel` (`AppChannelBackend` + `OffloadProxy`) |
+| **Trainer Offload Mechanism** | Cooperative `MegatronEngine.to("cpu")` + OS-level `cuda-checkpoint` | Driver-side `OffloadProxy` fanout -> `actor_rollout_to("cpu" / "cuda")` across all 8 ranks |
+| **Post-Snapshot GPU Memory Target** | `15.91 GiB/GPU` (co-resident with `cuda-checkpoint`) | `< 15.00 GiB/GPU` (`gpu_allocated_gb ~ 0.00 GiB`, parameters + optimizer in host RAM) |
+
+### 8.2 Elimination of Section 6.1 Multi-GPU Stability Workarounds
+
+Because `verl-app-channel-offload` dispatches snapshot/restore commands over the bidirectional gRPC `WorkloadChannel` stream directly to `OffloadProxy` in the `verl` driver—which invokes `actor_rollout_to("cpu")` and `actor_rollout_to("cuda")` in lockstep across all 8 `WorkerDict` ranks without ever calling `cuda-checkpoint` or pausing GPU threads mid-collective—**every single multi-GPU workaround from Section 6.1 is completely eliminated**:
+
+| Section 6.1 Workaround (`h200-t8-s2`) | Root Cause in `cuda-checkpoint` Mode | Why Eliminated in `h200-t8-s1` (`verl-app-channel-offload`) | Verification Status |
+| --- | --- | --- | --- |
+| **1. `NCCL_NVLS_ENABLE=0` & Extended Watchdog Timeouts** | `cuda-checkpoint --action lock` fails (`error 801`) on NVLink SHARP (`NVLS`) multicast handles (`cuMemCreate`) | `AppChannelBackend` never calls `cuda-checkpoint`; NCCL communicators remain live with default NVLS hardware acceleration enabled | **Eliminated** (`NCCL_NVLS_ENABLE=0` removed from `feature-timeslice.sh` and `timeslice.py`) |
+| **2. `libuniversal_cr_shim.so` (`LD_PRELOAD` / `TIMESLICE_SHIM_ENABLED`)** | Needed to intercept NCCL communicator creation for destroy/re-init around `cuda-checkpoint` | No OS-level GPU context checkpointing occurs; NCCL rings/trees and NVLS handles remain intact across offload/restore | **Eliminated** (`NCCL_SHIM_ENABLED=false` on `snapshot-agent`; zero `LD_PRELOAD` or `VLLM_NCCL_SO_PATH`) |
+| **3. `SIG35` / `SIG36` Signal Handlers & `trigger_cuda_checkpoint_transition()`** | Needed to tear down NCCL communicators pre-checkpoint and rebuild post-restore across 8 rank PIDs | `SnapshotAgentService.WorkloadChannel` sends `SnapshotCommand` / `RestoreCommand` over gRPC to `OffloadProxy`, which calls `actor_rollout_to` cleanly at phase boundaries | **Eliminated** (`SIG_PRE_CHECKPOINT`, `SIG_POST_RESTORE`, and `trigger_cuda_checkpoint_transition` removed) |
+| **4. `update_weights()` `post_sync:to_cpu` & `aggressive_empty_cache` + `TP=2` Sampler Sleep** | Needed to clear cross-rank IPC handles before `cuda-checkpoint` and coordinate `TP=2` sampler sleep | `OffloadProxy.offload()` runs `actor_rollout_to("cpu")` when `Yield()` triggers `Snapshot()`, and each job has a dedicated 1-GPU `TP=1` sampler (`TIMESLICE_SAMPLER_ENABLED=0`) | **Eliminated** (`update_weights` `post_sync` hunk removed; sampler runs un-timesliced) |
+
+### 8.3 Trainer GPU & CPU (Host) Memory Telemetry (`[gpu-mem]`)
+
+In `verl-app-channel-offload`, `MegatronEngine.to()` logs both GPU memory (`gpu_device_used_gb`, `gpu_allocated_gb`, `gpu_reserved_gb`, `gpu_device_total_gb`) and CPU host memory (`host_rss_gb`, `host_used_gb`, `cpu_resident_params`, `cpu_resident_opt_state`) on every `app_channel:to_cpu` and `app_channel:to_gpu` transition (`point=app_channel:to_cpu`, `point=app_channel:to_gpu`), verifying that post-snapshot GPU memory drops below the `< 15 GB` per GPU threshold while model shards (`cpu_resident_params`) and optimizer states (`cpu_resident_opt_state`) reside in host RAM (`host_rss_gb`, `host_used_gb`).
 
 ---
 

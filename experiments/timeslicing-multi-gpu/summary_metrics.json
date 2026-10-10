@@ -19,7 +19,7 @@
     ]
   },
   "baseline_feature_off": {
-    "run_id": "20261001-155249-disagg-memlog",
+    "run_id": "baseline",
     "steps_completed": 2,
     "mean_step_s": 1042.69,
     "mean_gen_s": 594.6,
@@ -59,7 +59,7 @@
     "concurrent_jobs": 2,
     "jobs": {
       "job1": {
-        "run_id": "20261008-203130-h200-t8-s2-timeslice-job1",
+        "run_id": "job1",
         "steps_completed": 2,
         "mean_step_s": 801.5,
         "mean_gen_s": 286.64,
@@ -103,7 +103,7 @@
         ]
       },
       "job2": {
-        "run_id": "20261008-204753-h200-t8-s2-timeslice-job2",
+        "run_id": "job2",
         "steps_completed": 2,
         "mean_step_s": 516.87,
         "mean_gen_s": 300.64,

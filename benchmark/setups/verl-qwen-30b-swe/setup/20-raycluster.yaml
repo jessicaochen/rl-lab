@@ -62,6 +62,8 @@ spec:
           app: verl-ray
           rlbench.timeslice.io/job-id: ${JOB_ID:-job1}
           rlbench.timeslice.io/role: trainer
+          timeslice.io/job-id: ${JOB_ID:-job1}
+          timeslice.io/group: ${TIMESLICE_TRAINER_GROUP:-trainers}
         annotations:
           gke-gcsfuse/volumes: "true"        # checkpoint bucket (full runs)
           gke-gcsfuse/cpu-limit: "8"
@@ -96,6 +98,12 @@ spec:
             value: eth0
           - name: GLOO_SOCKET_IFNAME
             value: eth0
+          - name: NODE_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+          - name: TIMESLICE_AGENT_ADDR
+            value: "$(NODE_IP):9001"
           resources:
             requests:
               ${TRAINER_GPU_REQ:-nvidia.com/gpu: 8}

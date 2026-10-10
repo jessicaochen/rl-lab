@@ -66,7 +66,7 @@ index f510875..1fb775c 100644
  
          logger.info("all initialize finished, ready to fit")
 diff --git a/verl/trainer/ppo/v1/trainer_separate_async.py b/verl/trainer/ppo/v1/trainer_separate_async.py
-index 18a06ee..5a31b6b 100644
+index 18a06ee..9c48a12 100644
 --- a/verl/trainer/ppo/v1/trainer_separate_async.py
 +++ b/verl/trainer/ppo/v1/trainer_separate_async.py
 @@ -21,6 +21,7 @@ from transfer_queue import KVBatchMeta
@@ -77,21 +77,42 @@ index 18a06ee..5a31b6b 100644
  from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
 +from verl.trainer.ppo.v1.utils import MetricsAggregator
  from verl.utils.config import omega_conf_to_dataclass
-@@ -79,11 +80,23 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+@@ -79,11 +80,39 @@ class PPOTrainerSeparateAsync(PPOTrainer):
              self.role_worker_mapping[Role.ActorRollout] = ray.remote(DetachActorWorker)
  
      def _setup(self):
-+        from verl.utils.gpu_mem_log import DualPoolRoleLocks
++        from verl.utils.gpu_mem_log import (
++            DualPoolRoleLocks,
++            OffloadSpec,
++            install_verl_offload,
++            spawn_offload_proxies,
++        )
 +
 +        self.role_locks = DualPoolRoleLocks.from_env()
 +        self.timeslice_enabled = self.role_locks.enabled
++        self.app_offload_enabled = DualPoolRoleLocks._parse_bool_env(
++            os.environ.get("TIMESLICE_APP_OFFLOAD"), default=True
++        )
 +        self.sampler_sleep_offload_enabled = DualPoolRoleLocks._parse_bool_env(
 +            os.environ.get("VERL_SAMPLER_SLEEP_OFFLOAD"), default=self.role_locks.sampler_enabled
 +        )
++        self._offload_proxies = None
 +        self.role_locks.acquire("trainer", step=0)
 +
          super()._setup()
  
++        if self.timeslice_enabled and self.app_offload_enabled:
++            self._offload_proxies = spawn_offload_proxies(
++                self.actor_rollout_wg.workers,
++                OffloadSpec(
++                    method="actor_rollout_to",
++                    snapshot_kwargs={"device": "cpu", "model": True, "optimizer": True, "grad": True},
++                    restore_kwargs={"device": "device", "model": True, "optimizer": True, "grad": False},
++                ),
++                job_id=self.role_locks.job_id,
++                group=self.role_locks.trainer_group,
++            )
++
 +        if self.timeslice_enabled:
 +            self.role_locks.acquire("sampler", step=0)
 +
@@ -102,7 +123,7 @@ index 18a06ee..5a31b6b 100644
          self.standalone_server_manager: LLMServerManager = LLMServerManager.create(
              config=self.config, start_rank=hybrid_num_replicas
          )
-@@ -97,8 +110,11 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+@@ -97,8 +126,11 @@ class PPOTrainerSeparateAsync(PPOTrainer):
          )
  
          # hybrid engine is in rollout mode after initialization
@@ -116,7 +137,7 @@ index 18a06ee..5a31b6b 100644
  
      def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
          """Version-aware old_log_probs computation for Decoupled PPO.
-@@ -133,36 +149,161 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+@@ -133,36 +165,169 @@ class PPOTrainerSeparateAsync(PPOTrainer):
      def on_init_end(self):
          # update weights after loading checkpoint
          self.standalone_checkpoint_manager.update_weights(self.global_steps)
@@ -124,15 +145,15 @@ index 18a06ee..5a31b6b 100644
 +        if self.checkpoint_manager is not None:
 +            self.checkpoint_manager.update_weights(self.global_steps)
 +        if getattr(self, "timeslice_enabled", False):
-+            # Trainer parameters were offloaded via post_sync:to_cpu inside update_weights;
-+            # release trainer lock so peer jobs can initialize/train while we retain sampler lock for Step 1.
++            # Release trainer lock after initial weight sync; when a peer job is queued,
++            # timesliceorchestrator dispatches app-channel Snapshot to OffloadProxy.
 +            self.role_locks.release("trainer", step=0)
  
      def on_train_begin(self):
          if self.config.skip.rollout_tq.enable:
              return
 +        if getattr(self, "timeslice_enabled", False) or getattr(self, "sampler_sleep_offload_enabled", False):
-+            logger.info("[timeslice] Skipping warmup batches so each step drains cleanly before vLLM sleep")
++            logger.info("[timeslice] Skipping warmup batches so each step runs in lockstep with trainer lock")
 +            return
          num_warmup_batches = self.config.trainer.v1.separate_async.num_warmup_batches
          for _ in range(num_warmup_batches):
@@ -152,11 +173,17 @@ index 18a06ee..5a31b6b 100644
 +                self.standalone_checkpoint_manager.sleep_replicas()
 +            self.role_locks.release("sampler", step=self.global_steps)
 +            self.role_locks.release("trainer", step=self.global_steps)
++            if getattr(self, "_offload_proxies", None) is not None:
++                self._offload_proxies.close()
++                self._offload_proxies = None
 +
 +    def on_train_end(self):
 +        if getattr(self, "timeslice_enabled", False):
 +            self.role_locks.release("sampler", step=self.global_steps)
 +            self.role_locks.release("trainer", step=self.global_steps)
++            if getattr(self, "_offload_proxies", None) is not None:
++                self._offload_proxies.close()
++                self._offload_proxies = None
 +
      def on_sample_begin(self):
 -        if self.current_mode == HybridEngineMode.TRAINER and self.should_switch_to_rollout():
@@ -185,7 +212,7 @@ index 18a06ee..5a31b6b 100644
 +        )
 +        sample_batch_size = train_batch_size // self.parameter_sync_step
 +
-+        # Phase 1: Sampling Phase (holding ONLY sampler lock when sampler time-slicing is enabled)
++        # Phase 1: Sampling Phase (outside trainer lock; sampler is unshared in h200-t8-s1)
 +        self.role_locks.acquire("sampler", step=self.global_steps)
 +        self._add_batch_to_generate()
 +
@@ -203,13 +230,12 @@ index 18a06ee..5a31b6b 100644
 +                self.on_sample_end()
 +                sampled_batches.append((batch, off_policy_metrics))
 +
-+        # Drain in-flight requests, sleep standalone vLLM replicas (level=1), and yield sampler lock
 +        if getattr(self, "sampler_sleep_offload_enabled", False):
 +            self.standalone_checkpoint_manager.abort_replicas()
 +            self.standalone_checkpoint_manager.sleep_replicas()
 +        self.role_locks.release("sampler", step=self.global_steps)
 +
-+        # Phase 2: Training Phase (holding ONLY trainer lock when trainer time-slicing is enabled)
++        # Phase 2: Training Phase (holding trainer lock; restored via WorkloadChannel if previously offloaded)
 +        self.role_locks.acquire("trainer", step=self.global_steps)
 +
 +        metrics_aggregator = MetricsAggregator()
@@ -258,7 +284,7 @@ index 18a06ee..5a31b6b 100644
 +        return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
 +
      def on_step_end(self):
-+        # Phase 3: Weight Sync Phase (holding trainer lock, acquire sampler lock in TRAINER -> SAMPLER order)
++        # Phase 3: Weight Sync Phase (holding trainer lock)
 +        if getattr(self, "timeslice_enabled", False):
 +            self.role_locks.acquire("sampler", step=self.global_steps)
 +            if getattr(self, "sampler_sleep_offload_enabled", False):
@@ -275,14 +301,17 @@ index 18a06ee..5a31b6b 100644
 +                    self.standalone_checkpoint_manager.sleep_replicas()
 +                self.role_locks.release("sampler", step=self.global_steps)
 +                self.role_locks.release("trainer", step=self.global_steps)
++                if getattr(self, "_offload_proxies", None) is not None:
++                    self._offload_proxies.close()
++                    self._offload_proxies = None
 +            else:
-+                # Trainer parameters were offloaded via post_sync:to_cpu inside update_weights;
-+                # release trainer lock and retain sampler lock for next step's Sampling Phase.
++                # Release trainer lock; when peer job is waiting, orchestrator triggers
++                # snapshot-agent -> WorkloadChannel -> OffloadProxy -> actor_rollout_to("cpu").
 +                self.role_locks.release("trainer", step=self.global_steps)
  
      def _get_n_gpus_for_throughput(self) -> int:
          """Include standalone rollout GPUs in the throughput denominator.
-@@ -179,6 +320,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+@@ -179,6 +344,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
  
      def switch_to_rollout(self):
          # TODO: disable auto offload in config and offload according to the switch strategy
@@ -291,7 +320,7 @@ index 18a06ee..5a31b6b 100644
          self.checkpoint_manager.update_weights(self.global_steps)
          self.checkpoint_manager.resume_generation_replicas()
          self.add_replicas_to_balancer()
-@@ -186,12 +329,16 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+@@ -186,12 +353,16 @@ class PPOTrainerSeparateAsync(PPOTrainer):
  
      def switch_to_trainer(self):
          # TODO: disable auto offload in config and offload according to the switch strategy
@@ -308,7 +337,7 @@ index 18a06ee..5a31b6b 100644
          global_load_balancer = self.standalone_server_manager.global_load_balancer
          servers = dict(
              zip(self.llm_server_manager.server_addresses, self.llm_server_manager.server_handles, strict=True)
-@@ -199,6 +346,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+@@ -199,6 +370,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
          ray.get(global_load_balancer.add_servers.remote(servers))
  
      def remove_replicas_from_balancer(self):
@@ -319,10 +348,10 @@ index 18a06ee..5a31b6b 100644
  
 diff --git a/verl/utils/gpu_mem_log.py b/verl/utils/gpu_mem_log.py
 new file mode 100644
-index 0000000..e456705
+index 0000000..f6c3198
 --- /dev/null
 +++ b/verl/utils/gpu_mem_log.py
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,96 @@
 +# Instrumentation for rl-lab gpu-host-offload and timeslicing-multi-gpu experiments.
 +# One-line GPU + host memory snapshots printed around every GPU<->host move,
 +# on every rank. Lines start with "[gpu-mem]" and are parsed by report.py.
@@ -339,21 +368,37 @@ index 0000000..e456705
 +
 +from timeslice import (  # noqa: E402
 +    DualPoolRoleLocks,
++    OffloadProxy,
++    OffloadProxySet,
++    OffloadSpec,
++    RankFanout,
 +    RoleLockConfig,
 +    TimeSliceOrchestratorClient,
++    WorkloadHandle,
 +    format_offload_event,
 +    format_restore_event,
++    install_verl_offload,
++    register_workload,
++    spawn_offload_proxies,
 +)
 +
 +__all__ = [
 +    "DualPoolRoleLocks",
 +    "GB",
++    "OffloadProxy",
++    "OffloadProxySet",
++    "OffloadSpec",
++    "RankFanout",
 +    "RoleLockConfig",
 +    "TimeSliceOrchestratorClient",
++    "WorkloadHandle",
 +    "emit",
 +    "format_offload_event",
 +    "format_restore_event",
++    "install_verl_offload",
++    "register_workload",
 +    "snapshot",
++    "spawn_offload_proxies",
 +]
 +
 +GB = 1024**3
@@ -402,6 +447,9 @@ index 0000000..e456705
 +        fields.append(f"seconds={seconds:.3f}")
 +    fields += [f"{k}={v}" for k, v in extra.items()]
 +    print(" ".join(fields), flush=True)
+
+
+log_gpu_memory_usage = emit
 diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
 index 0358497..2279dd9 100644
 --- a/verl/utils/megatron_utils.py
@@ -466,7 +514,7 @@ index 0358497..2279dd9 100644
  def offload_megatron_copy_params(optimizers):
      """
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index e8a6c56..146fbbf 100644
+index e8a6c56..6dc12d2 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
 @@ -64,6 +64,7 @@ from verl.utils.megatron.tensor_parallel import (
@@ -486,32 +534,42 @@ index e8a6c56..146fbbf 100644
          """
          Move model parameters, optimizer states, or both to the specified device.
          Note that this function executes irrespective of offload config. It serves as manual control
-@@ -725,6 +726,24 @@ class MegatronEngine(BaseEngine):
+@@ -724,7 +725,33 @@ class MegatronEngine(BaseEngine):
+             return
          device_name = get_device_name()
++        if device == "device":
++            device = device_name
  
          assert device in (device_name, "cpu")
 +
-+        # [gpu-mem experiment] measure GPU + host memory and the offloadable footprint
-+        # before/after every move, on every rank. `point` names the call site; by default
-+        # it is derived from the engine mode (None at init, train/eval inside the contexts).
++        # [gpu-mem / timeslice] measure GPU + host memory and the offloadable footprint
++        # before/after every move, on every rank. When invoked via OffloadProxy's
++        # actor_rollout_to RPC outside train/eval contexts, self.mode is None after
++        # initialization, so point resolves to "app_channel".
 +        import os as _os
 +        import time as _time
 +
-+        from verl.utils.gpu_mem_log import emit, format_offload_event, format_restore_event, snapshot
++        from verl.utils.gpu_mem_log import emit, format_offload_event, format_restore_event, log_gpu_memory_usage, snapshot
 +
 +        if point is None:
-+            point = {None: "init", "train": "train_end", "eval": "eval_end"}.get(getattr(self, "mode", None), str(self.mode))
++            if getattr(self, "mode", None) is None:
++                if getattr(self, "_init_offload_done", False):
++                    point = "app_channel"
++                else:
++                    self._init_offload_done = True
++                    point = "init"
++            else:
++                point = {"train": "train_end", "eval": "eval_end"}.get(getattr(self, "mode", None), str(self.mode))
 +        direction = "to_cpu" if device == "cpu" else "to_gpu"
 +        tag = f"{point}:{direction}"
 +        snap_before = snapshot()
 +        fp_before = megatron_footprint(self.module, self.optimizer)
 +        emit("trainer", tag, "before", snap_before, model=int(model), optimizer=int(optimizer), grad=int(grad), **fp_before)
 +        _t0 = _time.perf_counter()
-+
+ 
          if device == device_name:
              if model:
-                 load_megatron_model_to_gpu(self.module, load_grad=grad)
-@@ -738,6 +757,64 @@ class MegatronEngine(BaseEngine):
+@@ -738,6 +765,64 @@ class MegatronEngine(BaseEngine):
          else:
              raise ValueError(f"Invalid device type: {device}")
  
@@ -542,7 +600,7 @@ index e8a6c56..146fbbf 100644
 +            bytes_copied_to_gpu=copied_back,
 +            **fp_after,
 +        )
-+        if _os.environ.get("VERL_TRAINER_POST_SYNC_OFFLOAD", _os.environ.get("TIMESLICE_TRAINER_ENABLED", _os.environ.get("TIMESLICE_ENABLED", "0"))) == "1":
++        if _os.environ.get("TIMESLICE_TRAINER_ENABLED", _os.environ.get("TIMESLICE_ENABLED", "0")) == "1" or point == "app_channel":
 +            import torch.distributed as _dist
 +
 +            _rk = _dist.get_rank() if (_dist.is_available() and _dist.is_initialized()) else int(_os.environ.get("RANK", -1))
@@ -576,199 +634,3 @@ index e8a6c56..146fbbf 100644
      def get_data_parallel_rank(self):
          if self.engine_config.dynamic_context_parallel:
              # in order to let every dp-cp group has full data to split, we set dp=1
-diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
-index c0ef011..d8e2d2a 100644
---- a/verl/workers/engine_workers.py
-+++ b/verl/workers/engine_workers.py
-@@ -755,6 +755,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
-                 return metrics or {}
-             per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-             metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
-+            # [gpu-mem experiment] get_per_tensor_param reloaded the params for export; offload
-+            # them again right away (mirrors step 3 of the naive path below), so the trainer
-+            # GPUs hold nothing offloadable while waiting for the next batch.
-+            if self.actor.engine.is_param_offload_enabled and os.environ.get("VERL_TRAINER_POST_SYNC_OFFLOAD", "1") == "1":
-+                self.actor.engine.to("cpu", model=True, optimizer=False, grad=False, point="post_sync")
-+                aggressive_empty_cache(force_sync=True)
-             return metrics or {}
- 
-         set_expandable_segments(False)
-diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
-index a015e8f..0bb028c 100644
---- a/verl/workers/rollout/vllm_rollout/utils.py
-+++ b/verl/workers/rollout/vllm_rollout/utils.py
-@@ -204,6 +204,24 @@ class vLLMColocateWorkerExtension:
-         spec = self.model_runner.vllm_config.speculative_config
-         return spec is not None and spec.method == "mtp" and self._get_drafter_model() is not None
- 
-+    def report_memory(self) -> dict:
-+        """[gpu-mem experiment] GPU/host snapshot of this TP worker process plus the logical
-+        sizes of the loaded weights and KV cache (sizes stay constant while asleep; the
-+        device-level numbers show what is physically resident)."""
-+        from verl.utils.gpu_mem_log import snapshot
-+
-+        snap = snapshot()
-+        try:
-+            weights = sum(p.numel() * p.element_size() for m in self._iter_all_models() for p in m.parameters())
-+        except Exception:
-+            weights = -1
-+        try:
-+            kv_caches = getattr(self.model_runner, "kv_caches", None) or []
-+            kv = sum(t.numel() * t.element_size() for t in kv_caches if isinstance(t, torch.Tensor))
-+        except Exception:
-+            kv = -1
-+        return {"rank": getattr(self, "rank", -1), "snapshot": snap, "weights_bytes": weights, "kv_cache_bytes": kv}
-+
-     def _iter_all_models(self):
-         """Yield models that need weight updates.
- 
-diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
-index 55821b7..5ff651e 100644
---- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
-+++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
-@@ -786,10 +786,50 @@ class vLLMHttpServer:
-             # is configured (vLLM scheduler treats it as such).
-             await self.engine.reset_prefix_cache(reset_connector=True)
-         elif self.rollout_mode == RolloutMode.STANDALONE:
--            logger.info("skip wake_up in standalone mode")
-+            if os.environ.get("VERL_SAMPLER_SLEEP_OFFLOAD", os.environ.get("TIMESLICE_SAMPLER_ENABLED", "0")) == "1":
-+                import time as _time
-+
-+                from verl.utils.gpu_mem_log import emit, format_restore_event
-+
-+                _job_id = os.environ.get("TIMESLICE_JOB_ID", os.environ.get("JOB_ID", "job1"))
-+                _before_reports = await self.engine.collective_rpc("report_memory")
-+                _before_by_rank = {r["rank"]: r["snapshot"] for r in _before_reports}
-+                _t0 = _time.perf_counter()
-+                await self.engine.wake_up(tags=tags or ["weights", "kv_cache"])
-+                _wake_s = _time.perf_counter() - _t0
-+                await self.engine.reset_prefix_cache(reset_connector=True)
-+                _after_reports = await self.engine.collective_rpc("report_memory")
-+                for r in _after_reports:
-+                    extra = {k: v for k, v in r.items() if k not in ("snapshot", "rank")}
-+                    emit(
-+                        "sampler",
-+                        f"replica{self.replica_rank}:timeslice_wake",
-+                        "after_wake",
-+                        r["snapshot"],
-+                        seconds=_wake_s,
-+                        rank=r["rank"],
-+                        **extra,
-+                    )
-+                    _vb = _before_by_rank.get(r["rank"], r["snapshot"])["gpu_device_used_gb"]
-+                    print(
-+                        format_restore_event(
-+                            role="sampler",
-+                            rank=r["rank"],
-+                            point=f"replica{self.replica_rank}:wake_up",
-+                            seconds=_wake_s,
-+                            vram_before_gb=_vb,
-+                            vram_after_gb=r["snapshot"]["gpu_device_used_gb"],
-+                            job_id=_job_id,
-+                        ),
-+                        flush=True,
-+                    )
-+            else:
-+                logger.info("skip wake_up in standalone mode")
- 
-     async def sleep(self):
--        if self.node_rank != 0 or not self.config.free_cache_engine:
-+        if self.node_rank != 0:
-+            return
-+        if not self.config.free_cache_engine and os.environ.get("VERL_SAMPLER_SLEEP_OFFLOAD", os.environ.get("TIMESLICE_SAMPLER_ENABLED", "0")) != "1":
-             return
- 
-         if self.rollout_mode == RolloutMode.HYBRID:
-@@ -797,7 +837,55 @@ class vLLMHttpServer:
-         elif self.rollout_mode == RolloutMode.COLOCATED:
-             await self.engine.sleep(level=1)
-         elif self.rollout_mode == RolloutMode.STANDALONE:
--            logger.info("skip sleep in standalone mode")
-+            if os.environ.get("VERL_SAMPLER_SLEEP_OFFLOAD", os.environ.get("TIMESLICE_SAMPLER_ENABLED", "0")) == "1":
-+                import time as _time
-+
-+                from verl.utils.gpu_mem_log import emit, format_offload_event
-+
-+                _job_id = os.environ.get("TIMESLICE_JOB_ID", os.environ.get("JOB_ID", "job1"))
-+                _before_reports = await self.engine.collective_rpc("report_memory")
-+                _before_by_rank = {}
-+                for r in _before_reports:
-+                    _before_by_rank[r["rank"]] = r["snapshot"]
-+                    extra = {k: v for k, v in r.items() if k not in ("snapshot", "rank")}
-+                    emit(
-+                        "sampler",
-+                        f"replica{self.replica_rank}:timeslice_sleep",
-+                        "before",
-+                        r["snapshot"],
-+                        rank=r["rank"],
-+                        **extra,
-+                    )
-+                _t0 = _time.perf_counter()
-+                await self.engine.sleep(level=1)
-+                _sleep_s = _time.perf_counter() - _t0
-+                _after_reports = await self.engine.collective_rpc("report_memory")
-+                for r in _after_reports:
-+                    extra = {k: v for k, v in r.items() if k not in ("snapshot", "rank")}
-+                    emit(
-+                        "sampler",
-+                        f"replica{self.replica_rank}:timeslice_sleep",
-+                        "after_sleep",
-+                        r["snapshot"],
-+                        seconds=_sleep_s,
-+                        rank=r["rank"],
-+                        **extra,
-+                    )
-+                    _vb = _before_by_rank.get(r["rank"], r["snapshot"])["gpu_device_used_gb"]
-+                    print(
-+                        format_offload_event(
-+                            role="sampler",
-+                            rank=r["rank"],
-+                            point=f"replica{self.replica_rank}:sleep_level1",
-+                            seconds=_sleep_s,
-+                            vram_before_gb=_vb,
-+                            vram_after_gb=r["snapshot"]["gpu_device_used_gb"],
-+                            job_id=_job_id,
-+                        ),
-+                        flush=True,
-+                    )
-+            else:
-+                logger.info("skip sleep in standalone mode")
- 
-     async def clear_kv_cache(self):
-         if self.node_rank == 0:
-@@ -816,6 +904,35 @@ class vLLMHttpServer:
-         """
-         if self.node_rank != 0 or not self.config.free_cache_engine:
-             return
-+        if self.rollout_mode != RolloutMode.STANDALONE:
-+            return
-+        if os.environ.get("VERL_SAMPLER_SLEEP_OFFLOAD", os.environ.get("TIMESLICE_SAMPLER_ENABLED", "0")) == "1":
-+            # When sampler sleep offload is enabled, sleep(level=1) and wake_up() are orchestrated
-+            # around the sampler lock yield/acquire boundaries rather than inside weight sync.
-+            return
-+        # [gpu-mem experiment] "end of sampling" = this weight-sync pause (requests aborted
-+        # and drained). Measure -> offload everything vLLM can (sleep level 1: weights to
-+        # pinned host, KV cache discarded) -> measure -> reload -> measure, then hand back to
-+        # the normal flow (in-place weight update, prefix-cache drop, resume).
-+        import time as _time
-+
-+        from verl.utils.gpu_mem_log import emit
-+
-+        def _emit(event, reports, seconds=None):
-+            for r in reports:
-+                extra = {k: v for k, v in r.items() if k not in ("snapshot", "rank")}
-+                emit("sampler", f"replica{self.replica_rank}:sync_pause", event, r["snapshot"], seconds=seconds, rank=r["rank"], **extra)
-+
-+        _emit("before", await self.engine.collective_rpc("report_memory"))
-+        _t0 = _time.perf_counter()
-+        await self.engine.sleep(level=1)
-+        _sleep_s = _time.perf_counter() - _t0
-+        _emit("after_sleep", await self.engine.collective_rpc("report_memory"), _sleep_s)
-+        _t0 = _time.perf_counter()
-+        await self.engine.wake_up(tags=["weights", "kv_cache"])
-+        _wake_s = _time.perf_counter() - _t0
-+        await self.engine.reset_prefix_cache(reset_connector=True)
-+        _emit("after_wake", await self.engine.collective_rpc("report_memory"), _wake_s)
- 
-     async def resume_kv_cache(self):
-         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""

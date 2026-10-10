@@ -1,26 +1,22 @@
 # rlbench feature fragment: sourced by config/common.sh when `--feature timeslice` is active.
-# Configures llm-d-rl-time-slicing dual-pool lock coordination (`trainers` & `samplers`)
-# and multi-GPU trainer/sampler offload/restore lifecycle.
+# Configures llm-d-rl-time-slicing trainer lock coordination (`trainers`)
+# and verl-app-channel-offload multi-GPU trainer offload/restore lifecycle.
 set -euo pipefail
 
 export RLBENCH_NO_HYBRID_ROLLOUT=1
 export NO_HYBRID_ROLLOUT=1
 export TIMESLICE_ENABLED="${TIMESLICE_ENABLED:-1}"
 export TIMESLICE_TRAINER_ENABLED="${TIMESLICE_TRAINER_ENABLED:-1}"
-export TIMESLICE_SAMPLER_ENABLED="${TIMESLICE_SAMPLER_ENABLED:-1}"
-export VERL_TRAINER_POST_SYNC_OFFLOAD="${VERL_TRAINER_POST_SYNC_OFFLOAD:-$TIMESLICE_TRAINER_ENABLED}"
-export VERL_SAMPLER_SLEEP_OFFLOAD="${VERL_SAMPLER_SLEEP_OFFLOAD:-$TIMESLICE_SAMPLER_ENABLED}"
-export TIMESLICE_JOB_ID="${TIMESLICE_JOB_ID:-${JOB_ID:-job1}}"
+export TIMESLICE_SAMPLER_ENABLED="${TIMESLICE_SAMPLER_ENABLED:-0}"
+export TIMESLICE_APP_OFFLOAD="${TIMESLICE_APP_OFFLOAD:-1}"
+export VERL_TRAINER_POST_SYNC_OFFLOAD="${VERL_TRAINER_POST_SYNC_OFFLOAD:-0}"
+export VERL_SAMPLER_SLEEP_OFFLOAD="${VERL_SAMPLER_SLEEP_OFFLOAD:-0}"
+export TIMESLICE_JOB_ID="${JOB_ID:-${TIMESLICE_JOB_ID:-job1}}"
 export TIMESLICE_ORCHESTRATOR_ADDR="${TIMESLICE_ORCHESTRATOR_ADDR:-timeslice-timesliceorchestrator.timeslice-system.svc.cluster.local:50051}"
 export TIMESLICE_TRAINER_GROUP="${TIMESLICE_TRAINER_GROUP:-trainers}"
 export TIMESLICE_SAMPLER_GROUP="${TIMESLICE_SAMPLER_GROUP:-samplers}"
-export TIMESLICE_MODE="${TIMESLICE_MODE:-hybrid}"
+export TIMESLICE_MODE="${TIMESLICE_MODE:-app}"
 export ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.80}"
-export NCCL_NVLS_ENABLE=0
-export TORCH_NCCL_ENABLE_MONITORING=0
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=21600
-export NCCL_WATCHDOG_TIMEOUT_SEC=21600
-export TORCH_DISTRIBUTED_TIMEOUT=21600
 
 # Optional batch/session overrides via `--var TS_TRAIN_BATCH=...` etc.
 if [ -n "${TS_TRAIN_BATCH:-}" ]; then export TRAIN_BATCH="${TS_TRAIN_BATCH:-}"; fi
@@ -36,6 +32,7 @@ _TS_OVERRIDES=(
   "++ray_kwargs.ray_init.runtime_env.env_vars.TIMESLICE_ENABLED=\"$TIMESLICE_ENABLED\""
   "++ray_kwargs.ray_init.runtime_env.env_vars.TIMESLICE_TRAINER_ENABLED=\"$TIMESLICE_TRAINER_ENABLED\""
   "++ray_kwargs.ray_init.runtime_env.env_vars.TIMESLICE_SAMPLER_ENABLED=\"$TIMESLICE_SAMPLER_ENABLED\""
+  "++ray_kwargs.ray_init.runtime_env.env_vars.TIMESLICE_APP_OFFLOAD=\"$TIMESLICE_APP_OFFLOAD\""
   "++ray_kwargs.ray_init.runtime_env.env_vars.VERL_TRAINER_POST_SYNC_OFFLOAD=\"$VERL_TRAINER_POST_SYNC_OFFLOAD\""
   "++ray_kwargs.ray_init.runtime_env.env_vars.VERL_SAMPLER_SLEEP_OFFLOAD=\"$VERL_SAMPLER_SLEEP_OFFLOAD\""
   "++ray_kwargs.ray_init.runtime_env.env_vars.TIMESLICE_JOB_ID=\"$TIMESLICE_JOB_ID\""
@@ -44,24 +41,12 @@ _TS_OVERRIDES=(
   "++ray_kwargs.ray_init.runtime_env.env_vars.TIMESLICE_SAMPLER_GROUP=\"$TIMESLICE_SAMPLER_GROUP\""
   "++ray_kwargs.ray_init.runtime_env.env_vars.TIMESLICE_MODE=\"$TIMESLICE_MODE\""
   '++ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH="/opt/verl:/data/timeslice"'
-  '++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_NVLS_ENABLE="0"'
-  '++ray_kwargs.ray_init.runtime_env.env_vars.TORCH_NCCL_ENABLE_MONITORING="0"'
-  '++ray_kwargs.ray_init.runtime_env.env_vars.TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="21600"'
-  '++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_WATCHDOG_TIMEOUT_SEC="21600"'
-  '++ray_kwargs.ray_init.runtime_env.env_vars.TORCH_DISTRIBUTED_TIMEOUT="21600"'
   "actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEM_UTIL"
 )
 
-if [ "${TIMESLICE_SHIM_ENABLED:-0}" = "1" ] && [ -n "${TIMESLICE_SHIM_PATH:-}" ]; then
-  _TS_OVERRIDES+=(
-    "++ray_kwargs.ray_init.runtime_env.env_vars.LD_PRELOAD=\"${TIMESLICE_SHIM_PATH:-}\""
-    "++ray_kwargs.ray_init.runtime_env.env_vars.VLLM_NCCL_SO_PATH=\"${TIMESLICE_SHIM_PATH:-}\""
-  )
-fi
-
 EXTRA_OVERRIDES+=("${_TS_OVERRIDES[@]}")
 
-echo "feature-timeslice: enabled=$TIMESLICE_ENABLED trainer_ts=$TIMESLICE_TRAINER_ENABLED sampler_ts=$TIMESLICE_SAMPLER_ENABLED trainer_offload=$VERL_TRAINER_POST_SYNC_OFFLOAD sampler_offload=$VERL_SAMPLER_SLEEP_OFFLOAD job=$TIMESLICE_JOB_ID mode=$TIMESLICE_MODE addr=$TIMESLICE_ORCHESTRATOR_ADDR groups=($TIMESLICE_TRAINER_GROUP,$TIMESLICE_SAMPLER_GROUP) gpu_mem_util=$ROLLOUT_GPU_MEM_UTIL"
+echo "feature-timeslice: enabled=$TIMESLICE_ENABLED trainer_ts=$TIMESLICE_TRAINER_ENABLED sampler_ts=$TIMESLICE_SAMPLER_ENABLED app_offload=$TIMESLICE_APP_OFFLOAD trainer_offload=$VERL_TRAINER_POST_SYNC_OFFLOAD sampler_offload=$VERL_SAMPLER_SLEEP_OFFLOAD job=$TIMESLICE_JOB_ID mode=$TIMESLICE_MODE addr=$TIMESLICE_ORCHESTRATOR_ADDR groups=($TIMESLICE_TRAINER_GROUP,$TIMESLICE_SAMPLER_GROUP) gpu_mem_util=$ROLLOUT_GPU_MEM_UTIL"
 
 # Locate timeslice.py and verl-timeslice.patch (either alongside feature-timeslice.sh in the
 # uploaded working-dir or in ../features/timeslice) and apply them across all nodes in this RayCluster.
